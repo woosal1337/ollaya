@@ -48,7 +48,8 @@ rejections.
 
 ## The graph
 
-Kev's contract (`input_ids`, `decide_pos`, `opt_pos` → `scores`), 13 MB, weightless: transformers' Qwen3.5 text
+Kev's contract in its fork form (`prefix_ids`, `branch_ids`, `branch_job`, `decide_pos`, `opt_pos` → `scores`: the
+state runs once per request, see [kev.md](kev.md#fork-form)), weightless: transformers' Qwen3.5 text
 model with Jeeves' fused weights, recomputed by `llm_common/qwen35.py`, and the head's four tensors read by
 byte offset from `head.pt`. `weights_in_memory` is `bf16`, about 18 GB. The runner uses a 4,096-token budget
 per `session.run`, as for `nimble`.

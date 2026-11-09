@@ -25,27 +25,28 @@ import shutil
 import torch
 
 from ..llm_common import onnx_export as ox
-from ..llm_common.qwen35 import CHUNK, Qwen35Trunk
+from ..llm_common.qwen35 import CHUNK, Qwen35Trunk, fork_rows, fork_shapes, fork_trace, gather_hidden
 from ...weightless_sharded import safetensors_source, torchzip_source
 from . import ref
 from .check import decision_for
 from .layout import MAX_OPTIONS, JeevesLayout
 
-INPUT_NAMES = ["input_ids", "decide_pos", "opt_pos"]
+INPUT_NAMES = ["prefix_ids", "branch_ids", "branch_job", "decide_pos", "opt_pos"]
 OUTPUT_NAMES = ["scores"]
 
 
 class JeevesGraph(torch.nn.Module):
+    """The fork form (`Qwen35Trunk.fork`): a row is its prefix, then its branch; positions count from its start."""
+
     def __init__(self, text_model, head):
         super().__init__()
         self.trunk = Qwen35Trunk(text_model)
         self.head = head
 
-    def forward(self, input_ids, decide_pos, opt_pos):
-        h = self.trunk(input_ids).float()
-        rows = torch.arange(h.shape[0], device=h.device)
-        q = self.head.q(h[rows, decide_pos])                 # [R, P]
-        k = self.head.k(h[rows.unsqueeze(1), opt_pos])       # [R, K, P]
+    def forward(self, prefix_ids, branch_ids, branch_job, decide_pos, opt_pos):
+        hp, hb = self.trunk.fork(prefix_ids, branch_ids, branch_job)
+        q = self.head.q(gather_hidden(hp, hb, branch_job, decide_pos).float())     # [B, P]
+        k = self.head.k(gather_hidden(hp, hb, branch_job, opt_pos).float())        # [B, K, P]
         return (k @ q.unsqueeze(-1)).squeeze(-1) * self.head.scale
 
 
@@ -104,19 +105,17 @@ def export(out_dir, model_dir, qwen_dir, tokenizer_json):
     rows, _ = lay.encode(state, questions)
     up_rows, _ = ref.encode(enc, state, questions)
     assert rows == up_rows, "layout port differs from upstream"
-    T = -(-max(len(r["ids"]) for r in rows) // CHUNK) * CHUNK
-    ids = torch.full((2, T), enc.pad_id, dtype=torch.long)
-    for i, r in enumerate(rows):
-        ids[i, :len(r["ids"])] = torch.tensor(r["ids"])
-    args = (ids, torch.tensor([r["decide"] for r in rows]), torch.tensor([r["opts"] for r in rows]))
+    k = max(len(r["opts"]) for r in rows)
+    sample = (*map(torch.tensor, fork_rows([r["ids"] for r in rows], enc.pad_id)), torch.tensor([r["decide"] for r in rows]),
+              torch.tensor([r["opts"] + [0] * (k - len(r["opts"])) for r in rows]))
     with torch.no_grad():
-        got = graph(*args)
+        got = graph(*sample)
     print("graph scores on the sample:", [[round(float(x), 4) for x in row] for row in got])
 
-    R = torch.export.Dim("rows", min=1, max=4096)
-    N = torch.export.Dim("chunks", min=1, max=4096)
-    K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
-    dyn = {"input_ids": {0: R, 1: CHUNK * N}, "decide_pos": {0: R}, "opt_pos": {0: R, 1: K}}
+    dyn, B = fork_shapes()
+    dyn |= {"decide_pos": {0: B}, "opt_pos": {0: B, 1: torch.export.Dim("options", min=1, max=MAX_OPTIONS)}}
+    opts = torch.tensor([[10, 200, 300, 400, 500, 575], [260, 261, 262, 263, 264, 265], [0, 255, 256, 257, 400, 575]])
+    args = (*fork_trace(graph.trunk.m.embed_tokens.num_embeddings), torch.tensor([575, 300, 100]), opts)
     tmp = ox.scratch_dir("jeeves-export-")
     secs = ox.export_graph(graph, args, INPUT_NAMES, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
     print("exported in %.0fs" % secs)
@@ -135,13 +134,18 @@ def export(out_dir, model_dir, qwen_dir, tokenizer_json):
         "upstream": {"repo": ref.REPO, "revision": ref.REVISION, "code": ref.JEEVES_GIT, "format": meta["format"],
                      "tokenizer": {"repo": ref.TOKENIZER[0], "revision": ref.TOKENIZER[1], "path": ref.TOKENIZER[2]}},
         "contract": {
-            "inputs": {"input_ids": {"dtype": "int64", "shape": ["rows", "seq"],
-                                     "note": "one row per question; seq a multiple of 64; right-pad with the pad id"},
+            "form": "fork",
+            "inputs": {"prefix_ids": {"dtype": "int64", "shape": ["jobs", "prefix"],
+                                      "note": "shared row prefixes; prefix a multiple of 64"},
+                       "branch_ids": {"dtype": "int64", "shape": ["rows", "seq"],
+                                      "note": "each question's row after its prefix; seq a multiple of 64; right-pad with the pad id"},
+                       "branch_job": {"dtype": "int64", "shape": ["rows"], "note": "the prefix each row continues"},
                        "decide_pos": {"dtype": "int64", "shape": ["rows"], "note": "the row's last position"},
                        "opt_pos": {"dtype": "int64", "shape": ["rows", "k"],
                                    "note": "option-close positions after </think>; shorter rows pad with 0"}},
             "outputs": {"scores": {"dtype": "float32", "shape": ["rows", "k"], "note": "raw pointer scores"}},
-            "seq_multiple": CHUNK, "positions": "0..seq-1, implicit", "attention": "causal; no mask input"},
+            "seq_multiple": CHUNK, "positions": "0..prefix+seq-1, implicit: a row is its prefix, then its branch",
+            "attention": "causal; no mask input"},
         **decision_layout,
         "pad": enc.pad_id,
         "min_options": 1, "max_options": MAX_OPTIONS,

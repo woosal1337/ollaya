@@ -50,6 +50,12 @@ the base shards and `adapter_model.safetensors` stay byte for byte the authors'.
 read only at the 255 code rows. The vision tower and MTP tensors (348) are unused. `weights_in_memory`
 is `bf16`: about 18 GB.
 
+**Fork form.** Every row carries the whole request and differs only in its requested field, so the export takes
+the rows as `prefix_ids [jobs, prefix]`, `branch_ids [rows, seq]` and `branch_job [rows]`: the request runs once
+and each question adds a branch of about one 64-token chunk ([kev.md](kev.md#fork-form)).
+`last_pos` counts from the start of the row. A prefix longer than the 2,048-token budget still runs once per
+run, with branches filling half the budget beside it. The runner still reads row-form graphs.
+
 ## Differences from upstream
 
 - **Precision.** Upstream serves in BF16 autocast; Ollaya computes in fp32 on the BF16 weights, as for

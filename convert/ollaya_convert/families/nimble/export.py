@@ -27,26 +27,29 @@ import shutil
 import torch
 
 from ..llm_common import onnx_export as ox
-from ..llm_common.qwen35 import CHUNK, Qwen35Trunk, half_trunk
+from ..llm_common.qwen35 import CHUNK, Qwen35Trunk, fork_rows, fork_shapes, fork_trace, gather_hidden, half_trunk
 from ...weightless_sharded import safetensors_source
 from . import ref, ref_v3
 from .layout import NOUL_DEFAULTS, NimbleLayout
 
-INPUT_NAMES = ["input_ids", "last_pos"]
+INPUT_NAMES = ["prefix_ids", "branch_ids", "branch_job", "last_pos"]
 OUTPUT_NAMES = ["cand_logits"]
 SENTINEL = "\u0000NIMBLE_CONTENT\u0000"
 
 
 class NimbleGraph(torch.nn.Module):
+    """The fork form (`Qwen35Trunk.fork`): every row carries the whole request, so the request is the shared prefix and
+    each question's branch is its requested field; last_pos counts from the row's start."""
+
     def __init__(self, text_model, lm_head, code_ids):
         super().__init__()
         self.trunk = Qwen35Trunk(text_model)
         self.lm_head = lm_head
         self.register_buffer("code_ids", torch.tensor(code_ids, dtype=torch.long), persistent=False)
 
-    def forward(self, input_ids, last_pos):
-        h = self.trunk(input_ids).float()
-        hs = h[torch.arange(h.shape[0], device=h.device), last_pos]
+    def forward(self, prefix_ids, branch_ids, branch_job, last_pos):
+        hp, hb = self.trunk.fork(prefix_ids, branch_ids, branch_job)
+        hs = gather_hidden(hp, hb, branch_job, last_pos).float()
         w = self.lm_head.weight[self.code_ids]           # the untied LM head, only the code rows
         return hs @ w.transpose(0, 1)
 
@@ -135,25 +138,20 @@ def export(out_dir, adapter_dir, base_dir, checkpoint="v2", fp16=False):
                                         "criteria": {"billing": "charges", "tech": "bugs", "other": None}},
                                "upset": {"type": "score", "instructions": "How upset?", "criteria": ["calm", "annoyed", "furious"]}},
                               adapter_dir)
-    lens = [len(x) for x in prepared.full_ids]
-    T = -(-max(lens) // CHUNK) * CHUNK
-    ids = torch.zeros((2, T), dtype=torch.long)
-    for i, x in enumerate(prepared.full_ids):
-        ids[i, :len(x)] = torch.tensor(x)
-    args = (ids, torch.tensor([n - 1 for n in lens]))
+    rows = [list(x) for x in prepared.full_ids]
     with torch.no_grad():
         want = src.forward(model, prepared, adapter_dir)
     if fp16:
         half_trunk(graph.trunk)   # after the fp32 reference: the trunk shares upstream's modules; the LM head stays fp32
     with torch.no_grad():
-        got = graph(*args)
+        got = graph(*map(torch.tensor, fork_rows(rows, 0)), torch.tensor([len(r) - 1 for r in rows]))
     print("eager graph vs upstream candidate_logits: %.2e"
           % max(float((got[i, :len(w)].double() - torch.tensor(w)).abs().max()) for i, w in enumerate(want)))
 
-    R = torch.export.Dim("rows", min=1, max=4096)
-    N = torch.export.Dim("chunks", min=1, max=4096)
-    dyn = {"input_ids": {0: R, 1: CHUNK * N}, "last_pos": {0: R}}
+    dyn, B = fork_shapes()
+    dyn["last_pos"] = {0: B}
     tmp = ox.scratch_dir("nimble-export-")
+    args = (*fork_trace(graph.trunk.m.embed_tokens.num_embeddings), torch.tensor([575, 300, 100]))
     secs = ox.export_graph(graph, args, INPUT_NAMES, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
     print("exported in %.0fs" % secs)
     tmpl = templates(tok, spec["system_prompt"])
@@ -183,15 +181,20 @@ def export(out_dir, adapter_dir, base_dir, checkpoint="v2", fp16=False):
                      "lora": {"r": cfg["r"], "alpha": cfg["lora_alpha"], "scaling": cfg["lora_alpha"] / cfg["r"],
                               "merged": False}},
         "contract": {
+            "form": "fork",
             "inputs": {
-                "input_ids": {"dtype": "int64", "shape": ["rows", "seq"],
-                              "note": "one row per question; seq a multiple of 64; right-pad with any id"},
-                "last_pos": {"dtype": "int64", "shape": ["rows"], "note": "index of the row's last real token"},
+                "prefix_ids": {"dtype": "int64", "shape": ["jobs", "prefix"],
+                               "note": "shared row prefixes (the whole request); prefix a multiple of 64"},
+                "branch_ids": {"dtype": "int64", "shape": ["rows", "seq"],
+                               "note": "each question's row after its prefix; seq a multiple of 64; right-pad with any id"},
+                "branch_job": {"dtype": "int64", "shape": ["rows"], "note": "the prefix each row continues"},
+                "last_pos": {"dtype": "int64", "shape": ["rows"],
+                             "note": "index of the row's last real token, from the row's start"},
             },
             "outputs": {"cand_logits": {"dtype": "float32", "shape": ["rows", 255],
                                         "note": "next-token logits of codes.ids; a question reads its first k"}},
             "seq_multiple": CHUNK,
-            "positions": "0..seq-1, implicit",
+            "positions": "0..prefix+seq-1, implicit: a row is its prefix, then its branch",
             "attention": "causal; no mask input (right padding cannot reach earlier positions)",
         },
         "templates": tmpl,

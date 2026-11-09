@@ -25,6 +25,14 @@ const MAX_ROWS: usize = 4096;
 /// Padded tokens per `session.run`: a 9B's BF16 weights take 18 GB of a 24 GB GPU.
 const TOKEN_BUDGET: usize = 4096;
 const INPUTS: [&str; 3] = ["input_ids", "decide_pos", "opt_pos"];
+/// The same graph in the fork form ([`crate::fork`]).
+const FORK_INPUTS: [&str; 5] = [
+    "prefix_ids",
+    "branch_ids",
+    "branch_job",
+    "decide_pos",
+    "opt_pos",
+];
 const OUTPUT: &str = "scores";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,12 +123,14 @@ impl JeevesModel {
             |b| weights.configure(crate::kev::configure(b, device)?),
         )?;
         let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-        if inputs.len() != INPUTS.len()
-            || !INPUTS.iter().all(|n| inputs.contains(n))
+        let is =
+            |want: &[&str]| inputs.len() == want.len() && want.iter().all(|n| inputs.contains(n));
+        if !(is(&INPUTS) || is(&FORK_INPUTS))
             || !session.outputs().iter().any(|o| o.name() == OUTPUT)
         {
             return Err(Error::Model(format!(
-                "graph inputs {inputs:?} do not match the jeeves contract ({INPUTS:?} -> {OUTPUT:?})"
+                "graph inputs {inputs:?} do not match the jeeves contract ({INPUTS:?} or \
+                 {FORK_INPUTS:?} -> {OUTPUT:?})"
             )));
         }
         Ok(JeevesModel {
@@ -159,6 +169,53 @@ impl JeevesModel {
     /// Each row's option scores (its first `opts.len()` graph outputs). Rows run shortest first, in
     /// batches padded to a multiple of `seq_multiple`.
     pub fn scores(&self, rows: &[JeevesRow]) -> Result<Vec<Vec<f32>>, Error> {
+        if crate::fork::is_fork(&self.session) {
+            let ids: Vec<&[u32]> = rows.iter().map(|r| r.ids.as_slice()).collect();
+            let reads = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+                let k = run.iter().map(|&i| rows[i].opts.len()).max().unwrap_or(0);
+                let mut decide_pos = Array1::<i64>::zeros(run.len());
+                let mut opt_pos = Array2::<i64>::zeros((run.len(), k));
+                for (r, &i) in run.iter().enumerate() {
+                    decide_pos[r] = rows[i].decide as i64;
+                    for (c, &p) in rows[i].opts.iter().enumerate() {
+                        opt_pos[[r, c]] = p as i64;
+                    }
+                }
+                Ok(vec![
+                    (
+                        "decide_pos".into(),
+                        ort::value::Tensor::from_array(decide_pos)?.into(),
+                    ),
+                    (
+                        "opt_pos".into(),
+                        ort::value::Tensor::from_array(opt_pos)?.into(),
+                    ),
+                ])
+            };
+            let pad = self.layout.pad;
+            let runs = crate::fork::runs(&ids, self.seq_multiple, pad, TOKEN_BUDGET, MAX_ROWS);
+            let scores = crate::fork::outputs(
+                &self.session,
+                runs,
+                TOKEN_BUDGET,
+                self.device,
+                OUTPUT,
+                reads,
+            )?;
+            return scores
+                .into_iter()
+                .zip(rows)
+                .map(|(s, r)| {
+                    s.get(..r.opts.len()).map(<[f32]>::to_vec).ok_or_else(|| {
+                        Error::Model(format!(
+                            "{OUTPUT} has {} scores for {}",
+                            s.len(),
+                            r.opts.len()
+                        ))
+                    })
+                })
+                .collect();
+        }
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| rows[i].ids.len());
         let padded: Vec<usize> = order

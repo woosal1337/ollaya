@@ -26,6 +26,9 @@ const MAX_ROWS: usize = 4096;
 /// 18 GB of a 24 GB GPU, and every Nimble row repeats the whole request, so rows run long.
 const TOKEN_BUDGET: usize = 2048;
 const INPUTS: [&str; 2] = ["input_ids", "last_pos"];
+/// The same graph in the fork form ([`crate::fork`]): every row carries the whole request, so the
+/// request runs once and each question adds only its requested field.
+const FORK_INPUTS: [&str; 4] = ["prefix_ids", "branch_ids", "branch_job", "last_pos"];
 const OUTPUT: &str = "cand_logits";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,12 +129,14 @@ impl NimbleModel {
             |b| weights.configure(crate::decider::configure(b, device)?),
         )?;
         let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-        if inputs.len() != INPUTS.len()
-            || !INPUTS.iter().all(|n| inputs.contains(n))
+        let is =
+            |want: &[&str]| inputs.len() == want.len() && want.iter().all(|n| inputs.contains(n));
+        if !(is(&INPUTS) || is(&FORK_INPUTS))
             || !session.outputs().iter().any(|o| o.name() == OUTPUT)
         {
             return Err(Error::Model(format!(
-                "graph inputs {inputs:?} do not match the nimble contract ({INPUTS:?} -> {OUTPUT:?})"
+                "graph inputs {inputs:?} do not match the nimble contract ({INPUTS:?} or \
+                 {FORK_INPUTS:?} -> {OUTPUT:?})"
             )));
         }
         Ok(NimbleModel {
@@ -172,6 +177,33 @@ impl NimbleModel {
     /// batches padded to a multiple of `seq_multiple`.
     pub fn option_logits(&self, rows: &[NimbleRow]) -> Result<Vec<Vec<f32>>, Error> {
         let width = self.layout.code_ids().len();
+        if crate::fork::is_fork(&self.session) {
+            let ids: Vec<&[u32]> = rows.iter().map(|r| r.ids.as_slice()).collect();
+            let last = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+                let last_pos: Array1<i64> =
+                    run.iter().map(|&i| rows[i].ids.len() as i64 - 1).collect();
+                Ok(vec![(
+                    "last_pos".into(),
+                    ort::value::Tensor::from_array(last_pos)?.into(),
+                )])
+            };
+            let runs = crate::fork::runs(&ids, self.seq_multiple, self.pad, TOKEN_BUDGET, MAX_ROWS);
+            let logits =
+                crate::fork::outputs(&self.session, runs, TOKEN_BUDGET, self.device, OUTPUT, last)?;
+            return logits
+                .into_iter()
+                .zip(rows)
+                .map(|(l, r)| {
+                    if l.len() != width {
+                        return Err(Error::Model(format!(
+                            "{OUTPUT} has {} codes, not {width}",
+                            l.len()
+                        )));
+                    }
+                    Ok(l[..r.options].to_vec())
+                })
+                .collect();
+        }
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| rows[i].ids.len());
         let padded: Vec<usize> = order

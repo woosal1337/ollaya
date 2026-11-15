@@ -17,12 +17,14 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | --- | --- | --- | --- |
 | `INVALID_JSON` | 400 | The body is not valid JSON | Fix the request |
 | `UNAUTHORIZED` | 401 | The key is missing, malformed, unknown, revoked, or expired | Check `Authorization: Bearer oly_live_…` |
-| `INSUFFICIENT_CREDITS` | 402 | The organization's balance is used up | Add credit on the **Credits** page |
-| `SPEND_CAP_REACHED` | 402 | The key's or the organization's budget is used up | Raise the budget, or wait for the next month |
+| `INSUFFICIENT_CREDITS` | 402 | The organization's balance is used up | Ask the Ollaya Cloud team for credit with the form on the **Credits** page |
+| `SPEND_CAP_REACHED` | 402 | The key's or the organization's budget is used up | Raise the cap or the budget. A monthly cap or budget starts again in the next month |
 | `FORBIDDEN` | 403 | Your role does not allow this (management API) | Ask an Owner or Admin |
 | `MODEL_NOT_ALLOWED` | 403 | The key or the organization may not call this model | Change the key's or the organization's model access |
 | `IP_NOT_ALLOWED` | 403 | The key has an IP allowlist and the caller is outside it | Add the address to the key |
 | `BROWSER_NOT_ALLOWED` | 403 | The request came from a browser (`Origin` header) | Call Ollaya Cloud from your server |
+| `SSO_REQUIRED` | 403 | The organization requires single sign-on, the caller is not an Owner, and the dashboard session did not come from the organization's identity provider (management API, dashboard sessions only) | Sign in with single sign-on |
+| `TWO_FACTOR_REQUIRED` | 403 | The organization requires a second factor, and the person has neither two-step verification nor a passkey (management API, dashboard sessions only) | Add an authenticator app or a passkey on the **Sign-in security** page |
 | `MODEL_NOT_FOUND` | 404 | The model is not in the catalog | `GET /v1/models` lists the available models |
 | `NOT_FOUND` | 404 | The path does not exist | Check the path |
 | `METHOD_NOT_ALLOWED` | 405 | The path exists with other methods, listed in `Allow` | Use one of those |
@@ -34,6 +36,8 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | `RATE_LIMITED` | 429 | Over your request rate | Retry after `Retry-After`; the SDK does |
 | `CONCURRENCY_LIMITED` | 429 | Over your concurrent request limit | Retry after `Retry-After`; the SDK does |
 | `INTERNAL` | 500 | An error in Ollaya Cloud itself | Retry; tell us the request ID if it persists |
-| `QUEUE_FULL` | 503 | The model is overloaded, or about to load and not ready yet | Retry after `Retry-After`; the SDK does |
+| `QUEUE_FULL` | 503 | The model is overloaded or not loaded yet, the time in `X-Ollaya-Timeout-Ms` ran out before a worker answered, or Ollaya Cloud cannot read the balance of a new organization yet | Retry after `Retry-After`. The SDK does |
 
 Errors from the model itself (`TOO_MANY_OPTIONS`, `INPUT_TOO_LONG`, `STATE_TRUNCATED`, `INFERENCE_FAILED`, and the rest) pass through with Ollaya's own status and code; see [the API reference](/docs/api#errors). Only a `2xx` answer is billed: no error ever costs anything.
+
+The request log can show one more code, `USAGE_OUT_OF_BOUNDS`, next to a `2xx` status. It means that the worker reported more input tokens than the request can hold, or a cost too large to record. You got the answer, and the request costs nothing.

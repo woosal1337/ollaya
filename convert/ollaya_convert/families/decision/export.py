@@ -99,6 +99,58 @@ SAMPLE_QUESTIONS = {
     "a": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "charges", "tech": "bugs", "other": None}},
     "b": {"type": "score", "instructions": "How upset?", "criteria": ["calm", "annoyed", "furious"]},
 }
+FORK_CONTRACT = {
+    "form": "fork",
+    "inputs": {
+        "prefix_ids": {"dtype": "int64", "shape": ["jobs", "prefix"],
+                       "note": "shared row prefixes; prefix a multiple of 64"},
+        "branch_ids": {"dtype": "int64", "shape": ["rows", "seq"],
+                       "note": "each question's row after its prefix; seq a multiple of 64; right-pad with any id (pad)"},
+        "branch_job": {"dtype": "int64", "shape": ["rows"], "note": "the prefix each row continues"},
+        "query_pos": {"dtype": "int64", "shape": ["rows"], "note": "position of the row's last token"},
+        "cand_pos": {"dtype": "int64", "shape": ["rows", "k"],
+                     "note": "position of each option segment's last token in the row; rows with fewer options "
+                             "pad with 0"},
+    },
+    "outputs": {"logits": {"dtype": "float32", "shape": ["rows", "k"],
+                           "note": "raw candidate logits; the first k_row entries are the row's option logits"}},
+    "seq_multiple": CHUNK,
+    "positions": "0..prefix+seq-1, implicit: a row is its prefix, then its branch",
+    "attention": "causal; no mask input (right padding cannot reach earlier positions)",
+}
+
+
+def fork_check(d, graph):
+    """Print the eager fork graph against the author's forward (`d`, a reference) and against the row trunk (the same
+    modules in the row form), on the author's rows for two questions on one state."""
+    _, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
+    T = -(-max(len(it["ids"]) for it in items) // CHUNK) * CHUNK
+    ids = torch.full((len(items), T), d.pad, dtype=torch.long)
+    for i, it in enumerate(items):
+        ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
+    k = max(len(it["candidate_positions"]) for it in items)
+    row_args = (ids, torch.tensor([it["query_position"] for it in items]),
+                torch.tensor([it["candidate_positions"] + [0] * (k - len(it["candidate_positions"])) for it in items]))
+    fork = fork_args(items, d.pad)
+    assert fork[0].shape[1] >= CHUNK and fork[2].tolist() == [0] * len(items), "the sample rows must fork"
+    with torch.no_grad():
+        want = d.forward(items)
+        rows_out = DecisionGraph.forward(graph, *row_args)
+        got = graph(*fork)
+    print("eager fork graph vs the author's forward: %.2e"
+          % max(float((g[:len(w)] - w).abs().max()) for g, w in zip(got, want)))
+    print("fork graph vs row trunk: %.2e" % float((got - rows_out).abs().max()))
+
+
+def fork_export_args(vocab):
+    """(made-up inputs to trace the fork graph, their dynamic shapes): `fork_trace`, k 6, reads in both prefix and
+    branch."""
+    dyn, B = fork_shapes()
+    K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
+    dyn |= {"query_pos": {0: B}, "cand_pos": {0: B, 1: K}}
+    args = (*fork_trace(vocab), torch.tensor([575, 300, 100]),
+            torch.tensor([[10, 200, 300, 400, 500, 575], [260, 261, 262, 263, 264, 265], [0, 255, 256, 257, 400, 575]]))
+    return args, dyn
 
 
 def empty_model(d, root):
@@ -133,33 +185,9 @@ def export(slug, out_dir, root, empty=False):
     cfg = json.load(open(os.path.join(root, "decision_config.json"), encoding="utf-8"))
     assert cfg["prompt_version"] == PROMPT_VERSION and cfg["head_dim"] == 256, cfg
 
-    # The author's rows for two questions on one state: the fork graph is checked against the author's forward and
-    # against the row trunk (the same modules in the row form) on them.
     if not empty:
-        _, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
-        T = -(-max(len(it["ids"]) for it in items) // CHUNK) * CHUNK
-        ids = torch.full((len(items), T), d.pad, dtype=torch.long)
-        for i, it in enumerate(items):
-            ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
-        k = max(len(it["candidate_positions"]) for it in items)
-        row_args = (ids, torch.tensor([it["query_position"] for it in items]),
-                    torch.tensor([it["candidate_positions"] + [0] * (k - len(it["candidate_positions"])) for it in items]))
-        fork = fork_args(items, d.pad)
-        assert fork[0].shape[1] >= CHUNK and fork[2].tolist() == [0] * len(items), "the sample rows must fork"
-        with torch.no_grad():
-            want = d.forward(items)
-            rows_out = DecisionGraph.forward(graph, *row_args)
-            got = graph(*fork)
-        print("eager fork graph vs the author's forward: %.2e"
-              % max(float((g[:len(w)] - w).abs().max()) for g, w in zip(got, want)))
-        print("fork graph vs row trunk: %.2e" % float((got - rows_out).abs().max()))
-
-    dyn, B = fork_shapes()
-    K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
-    dyn |= {"query_pos": {0: B}, "cand_pos": {0: B, 1: K}}
-    # made-up inputs (`fork_trace`, k 6), with reads in both prefix and branch
-    args = (*fork_trace(backbone.embed_tokens.num_embeddings), torch.tensor([575, 300, 100]),
-            torch.tensor([[10, 200, 300, 400, 500, 575], [260, 261, 262, 263, 264, 265], [0, 255, 256, 257, 400, 575]]))
+        fork_check(d, graph)
+    args, dyn = fork_export_args(backbone.embed_tokens.num_embeddings)
     tmp = ox.scratch_dir("decision-export-")
     secs = ox.export_graph(graph, args, INPUT_NAMES, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
     print("exported in %.0fs" % secs)
@@ -195,25 +223,7 @@ def export(slug, out_dir, root, empty=False):
                      "code": {"model": meta["model_code"], "model_sha256": ox.sha256_file(os.path.join(root, meta["model_code"])),
                               "api": meta["api"], "api_sha256": ox.sha256_file(os.path.join(root, meta["api"]))},
                      "architecture": cfg["architecture"]},
-        "contract": {
-            "form": "fork",
-            "inputs": {
-                "prefix_ids": {"dtype": "int64", "shape": ["jobs", "prefix"],
-                               "note": "shared row prefixes; prefix a multiple of 64"},
-                "branch_ids": {"dtype": "int64", "shape": ["rows", "seq"],
-                               "note": "each question's row after its prefix; seq a multiple of 64; right-pad with any id (pad)"},
-                "branch_job": {"dtype": "int64", "shape": ["rows"], "note": "the prefix each row continues"},
-                "query_pos": {"dtype": "int64", "shape": ["rows"], "note": "position of the row's last token"},
-                "cand_pos": {"dtype": "int64", "shape": ["rows", "k"],
-                             "note": "position of each option segment's last token in the row; rows with fewer options "
-                                     "pad with 0"},
-            },
-            "outputs": {"logits": {"dtype": "float32", "shape": ["rows", "k"],
-                                   "note": "raw candidate logits; the first k_row entries are the row's option logits"}},
-            "seq_multiple": CHUNK,
-            "positions": "0..prefix+seq-1, implicit: a row is its prefix, then its branch",
-            "attention": "causal; no mask input (right padding cannot reach earlier positions)",
-        },
+        "contract": FORK_CONTRACT,
         "prompt_version": PROMPT_VERSION,
         "max_row_tokens": MAX_ROW_TOKENS,
         "min_options": MIN_OPTIONS,

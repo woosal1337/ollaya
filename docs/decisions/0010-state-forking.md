@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for `kev`, `decider` and `decision`, in their ONNX graphs and on MLX. The other families and llama.cpp are
-follow-ups (see Consequences).
+Accepted for `kev`, `decider`, `decision` and the Qwen3.5 tags of `decision2`, in their ONNX graphs and on MLX. The
+other families and llama.cpp are follow-ups (see Consequences).
 
 ## Date
 
@@ -49,19 +49,20 @@ Ollaya takes the idea and none of the code.
 
 ## Results
 
-kev-0.8b, decider-0.8b and decision-eos-0.8b in fp32 on ONNX Runtime, CPU, against goldens made from the authors'
-code (the edge cases and 40 typed-decisions requests):
+kev-0.8b, decider-0.8b, decision-eos-0.8b and decision2-eos-0.8b in fp32 on ONNX Runtime, CPU, against goldens made
+from the authors' code (the edge cases and 40 typed-decisions requests, and decision2's 13 cases of its own):
 
 | Model | Questions | Decisions the same | Max logit difference |
 |---|---:|---:|---:|
 | kev:0.8b | 580 | 100% | 4.5e-5 (as the row graph) |
 | decider:0.8b | 579 | 100% | 3.8e-5 |
 | decision:eos | 566 | 100% | 2.8e-5 (as the row graph) |
+| decision2:eos | 563 | 100% | 2.0e-5 (as the row graph) |
 
 On the 40 typed-decisions requests, kev's fork graph computes 35,968 tokens instead of 67,200. A decision row repeats
 less of its request: the shared start is about 210 of its 363 tokens, and the fork graph computes 51,840 tokens
-instead of 80,000. Latency of the same requests on one development machine (an Apple M5, CPU, `bench --ids td/`), not
-an edition machine:
+instead of 80,000. decision2's rows give the same counts. Latency of the same requests on one development machine
+(an Apple M5, CPU, `bench --ids td/`), not an edition machine:
 
 | Model | p50, row → fork | p95, row → fork | Memory, row → fork |
 |---|---|---|---|
@@ -70,7 +71,8 @@ an edition machine:
 | decision:eos | 2,798 → 1,712 ms | 14,233 → 2,649 ms | 7.5 → 5.8 GiB |
 
 The decision runs used `--warmup 3 --full-only` and took the memory from `/usr/bin/time -l` (peak memory footprint).
-Another job loaded the machine during them (load average about 16), so the row graph's p95 is noisy.
+Another job loaded the machine during them (load average about 16), so the row graph's p95 is noisy. decision2:eos
+has no CPU latency run: other jobs loaded the machine at the time, so its CPU times would mean nothing.
 
 The gain grows with the state: short one-line states save little, long ones approach one state per request instead
 of one per question.
@@ -85,18 +87,24 @@ on macOS does not count the buffers of MLX.
 | kev:0.8b | 580 of 580 | 3.6e-5 | 1,155 → 585 ms | 1,863 → 789 ms | 5.6 → 4.7 GiB |
 | decider:0.8b | 579 of 579 | 4.2e-5 | 2,744 → 1,123 ms | 4,251 → 1,741 ms | 6.0 → 5.4 GiB |
 | decision:eos | 566 of 566 | 1.8e-5 | 1,531 → 1,135 ms | 2,200 → 1,916 ms | 5.7 → 4.8 GiB |
+| decision2:eos | 563 of 563 | 2.6e-5 | 1,368 → 739 ms | 2,143 → 1,020 ms | 6.1 → 5.5 GiB |
+
+decision2:eos had one run of each path. Other jobs loaded the machine during them (load average 14 to 19).
 
 ## Consequences
 
 - A family moves to the fork form with its export and its runner, and ships after its gate on CUDA and the CPU, as
   any graph change does (`docs/model-lifecycle.md`). kev's and decider's larger tags, the `-fp16` tags and CUDA are
-  not gated yet, and neither is decision on CUDA.
-- Still in the row form: `nimble` and `jeeves` (converted on a branch, waiting for a 9B gate), `decision2`, `d3`,
-  `strands`, `arbiter` and `decider-vision`. Attention-only trunks (Qwen3, Gemma) need only the keys and values.
+  not gated yet, and neither are decision and decision2 on CUDA. The decision2 export also writes Sol, Nox and Lux in
+  the fork form, but they have no gate with it yet.
+- Still in the row form: `nimble` and `jeeves` (converted on a branch, waiting for a 9B gate), `decision2:kai` (a
+  Qwen3 trunk), `d3`, `strands`, `arbiter` and `decider-vision`. Attention-only trunks (Qwen3, Gemma) need only the
+  keys and values.
 - The MLX engine computes from the weights, not the graph, so it has its own fork (`Qwen35::fork` in
-  `mlx/qwen35.rs`). On MLX, `kev`, `decider` and `decision` fork whenever the backbone is Qwen3.5
-  (`Decoder::forks`), whatever the form of the installed graph. kev:0.8b, decider:0.8b and decision:eos pass their
-  gate on Metal with the fork (Results). Their larger tags have no Metal run with the fork yet.
+  `mlx/qwen35.rs`). On MLX, `kev`, `decider`, `decision` and `decision2` fork whenever the backbone is Qwen3.5
+  (`Decoder::forks`), whatever the form of the installed graph. kev:0.8b, decider:0.8b, decision:eos and
+  decision2:eos pass their gate on Metal with the fork (Results). Their larger tags have no Metal run with the fork
+  yet, and decision2 has no arch layer in the library, so installed decision2 models do not run on MLX.
 - llama.cpp can fork a recurrent cache (`llama_memory_seq_cp` copies the state on write), but that changes the
   model's batch split, which moves its numbers away from the goldens of the authors' client. That needs its own
   decision.

@@ -102,14 +102,43 @@ Decision 1.0's ([decision.md](decision.md#onnx-contract)): `input_ids` [rows, se
 [rows], `cand_pos` [rows, k] → `logits` [rows, k]. Rows are padded to `contract.seq_multiple`: 64
 (one DeltaNet scan chunk) for the Qwen3.5 models, 8 for Kai, whose layers are all causal attention.
 
-- **Export.** `families/decision2/export.py` builds `decision.export.DecisionGraph` with
-  `llm_common/qwen35.py` or, for Kai, `llm_common/qwen3.py`, and checks the eager graph against the
-  author's forward before exporting. Lux in fp32 does not fit the export job's memory, so it is
-  exported with `--empty-weights` (initializers mapped by name and shape, as for Decision 1.0's Lux).
+- **Export.** `families/decision2/export.py` builds `decision.export.DecisionForkGraph` (the
+  [fork form](#fork-form)) with `llm_common/qwen35.py` or, for Kai, `decision.export.DecisionGraph`
+  with `llm_common/qwen3.py`, and checks the eager graph against the author's forward before
+  exporting. Lux in fp32 does not fit the export job's memory, so it is exported with
+  `--empty-weights` (initializers mapped by name and shape, as for Decision 1.0's Lux).
 - **Weights.** Every parameter references the author's files by byte offset: BF16 tensors through
   one `Cast` to float32, F32 tensors directly. `decision.json` sets `weights_in_memory` from the
   BF16 bytes (`onnx_export.weights_in_memory`): above 6 GiB the casts are not folded at load, so the
   weights stay in BF16 in memory and widen one layer at a time, as for decider.
+
+### Fork form
+
+The export writes the Qwen3.5 tags in the fork form of Decision 1.0's graph (`contract.form`
+`"fork"` in `decision.json`, [decision.md](decision.md#fork-form)). Every row of a request starts
+with `Context:` and the state, so the graph computes that shared start once and continues it into
+each question ([ADR 0010](../decisions/0010-state-forking.md)). The graph takes `prefix_ids` [jobs,
+prefix], `branch_ids` [rows, seq] and `branch_job` [rows] instead of `input_ids`. `query_pos`,
+`cand_pos` and `logits` do not change, and the positions count from the start of the row. The
+numbers are the row form's. The runner also reads row-form graphs. On MLX, the Qwen3.5 tags fork
+whatever the form of the graph.
+
+Kai stays in the row form, because its Qwen3 trunk has no fork yet. Kai does not run on Metal.
+
+`decision2:eos` on an Apple M5, against goldens made on the same machine from the author's code
+(fp32 on the CPU, `--td-limit 40`): 152 cases (25 rejected by the author), 563 questions. The gate
+is unchanged (option logits within 1e-3, the same decisions).
+
+| Eos | rejections, rows, positions | decisions agree | max \|Δ option logit\| | max \|Δ probability\| |
+|---|---|---|---|---|
+| row graph, CPU | 0 mismatches | **100 %** | 2.0e-5 | 4.1e-6 (p99 3.0e-6) |
+| fork graph, CPU | 0 mismatches | **100 %** | 2.0e-5 | 4.1e-6 (p99 3.0e-6) |
+| fork on Metal (MLX) | 0 mismatches | **100 %** | 2.6e-5 | 3.7e-6 (p99 2.6e-6) |
+
+The CPU records of the two graphs are identical. In eager fp32 the fork graph is 3.3e-6 from the
+author's forward, as the row graph is, and 0 from the row trunk. The wire answers equal the
+author's up to the rounding (max difference 5.3e-5). Sol, Nox and Lux have no gate in the fork form
+yet.
 
 ## Measured parity
 
@@ -148,8 +177,9 @@ The records are in `results/runs/2026-10-25-parity-rtx5090-{cuda,cpu}-cob561.jso
 
 - **Options.** Choice 2..255, score 2..10 levels, noul.
 - **Context.** Kai 8,192 tokens per question, the others 16,384, the state included.
-- **Cost.** Every question re-reads the whole state; `share_context` (one pass for all questions)
-  is not ported.
+- **Cost.** A fork graph and MLX compute the state once per request ([Fork form](#fork-form)).
+  Kai's row graph re-reads the whole state for every question. Upstream's `share_context` mode is
+  not ported.
 - **Runtime qualification.** Upstream runs the backbone under BF16 autocast on a GPU; Ollaya's
   graph is checked against the author's code in fp32.
 

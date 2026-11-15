@@ -167,7 +167,8 @@ continues it into each question ([ADR 0010](../decisions/0010-state-forking.md))
 Row `b` is `prefix_ids[branch_job[b]] ++ branch_ids[b]`. `query_pos`, `cand_pos` and `logits` do not
 change, and the positions count from the start of the row. The numbers are the row form's. The split
 and the contract are the same as kev's ([kev.md](kev.md#fork-form)). The runner also reads row-form
-graphs, and `decision2` stays in the row form.
+graphs. `decision2` exports its Qwen3.5 tags in the same fork form, and Kai in the row form
+([decision2.md](decision2.md#fork-form)).
 
 ## Measured parity
 

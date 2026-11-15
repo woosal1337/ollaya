@@ -7,7 +7,7 @@ order: 21
 
 # API keys
 
-Every request to `https://api.{{SITE_HOST}}` carries a key in `Authorization: Bearer <key>`. Keys belong to an organization; anyone in it with the Owner, Admin, or Developer role can create them on the dashboard's **Keys** page or through the management API.
+Every request to `https://api.{{SITE_HOST}}` carries a key in `Authorization: Bearer <key>`. Keys belong to an organization. Anyone in it with the Owner, Admin, or Developer role can create them on the dashboard's **API keys** page or through the management API.
 
 A key is `oly_live_` (or `oly_test_` for a test key) followed by 46 characters, the last six of them a checksum, so a mistyped key is refused before it is looked up. Ollaya Cloud stores only a keyed hash of each key and a masked form (`oly_live_…abcd`), so a key is shown once, when it is created, and never again. If you lose it, create a new one.
 
@@ -15,7 +15,7 @@ A key is `oly_live_` (or `oly_test_` for a test key) followed by 46 characters, 
 
 | Setting | Effect |
 |---|---|
-| Scope | `inference` calls models (`/v1/*`, `/api/decide`); `management` manages the organization through the management API (Owners and Admins only). A `read` scope is reserved for read-only access and opens no route yet. |
+| Scope | `inference` calls models (`/v1/*`, `/api/decide`). `management` calls the management API: it manages keys and reads usage, requests, credits, and limits, with the role of the member who created it. Only Owners and Admins create management keys. A `read` scope is reserved for read-only access and opens no route yet. |
 | Allowed models | Only these models; any other answers `403 MODEL_NOT_ALLOWED` |
 | Spend cap | A budget per month or in total; once it is used up the key answers `402 SPEND_CAP_REACHED` |
 | Rate and concurrency | Lower limits than the organization's, for one noisy client |
@@ -30,4 +30,8 @@ A key belongs in your server's environment or secret store, never in a web page 
 
 ## Revoke a key
 
-Revoke a key on the **Keys** page. Every gateway refuses it within a second, everywhere. The **Audit** page records who created, changed, and revoked each key.
+Revoke a key on the **API keys** page. Every gateway refuses it at once in normal operation. If the gateways cannot get the message, they refuse the key at most 60 seconds later. The audit log (**Settings** → **Audit log**, for Owners and Admins) records who created, changed, and revoked each key.
+
+## Remove a member
+
+When an Owner or Admin removes a member on the **Members** page, Ollaya Cloud first revokes the active keys that the member created. To keep these keys working, select **Keep *name*'s keys working** before you remove the member. A kept key bills the organization as before. A kept management key stops working, because it acts with the role of its creator.

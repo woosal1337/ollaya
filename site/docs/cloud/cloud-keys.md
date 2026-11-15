@@ -9,17 +9,17 @@ order: 21
 
 Every request to `https://api.{{SITE_HOST}}` carries a key in `Authorization: Bearer <key>`. Keys belong to an organization. Anyone in it with the Owner, Admin, or Developer role can create them on the dashboard's **API keys** page or through the management API.
 
-A key is `oly_live_` (or `oly_test_` for a test key) followed by 46 characters, the last six of them a checksum, so a mistyped key is refused before it is looked up. Ollaya Cloud stores only a keyed hash of each key and a masked form (`oly_live_…abcd`), so a key is shown once, when it is created, and never again. If you lose it, create a new one.
+A key is `oly_live_` (or `oly_test_` for a test key) followed by 46 characters. The last six characters are a checksum, so Ollaya Cloud refuses a mistyped key before it looks it up. Ollaya Cloud stores only a keyed hash of each key and a masked form (`oly_live_…abcd`). So you see a key once, when you create it, and never again. If you lose it, create a new one.
 
 ## What a key may do
 
 | Setting | Effect |
 |---|---|
 | Scope | `inference` calls models (`/v1/*`, `/api/decide`). `management` calls the management API: it manages keys and reads usage, requests, credits, and limits, with the role of the member who created it. Only Owners and Admins create management keys. A `read` scope is reserved for read-only access and opens no route yet. |
-| Allowed models | Only these models; any other answers `403 MODEL_NOT_ALLOWED` |
-| Spend cap | A budget per month or in total; once it is used up the key answers `402 SPEND_CAP_REACHED` |
+| Allowed models | Only these models. Any other model answers `403 MODEL_NOT_ALLOWED` |
+| Spend cap | A budget per month or in total. Once it is used up, the key answers `402 SPEND_CAP_REACHED` |
 | Rate and concurrency | Lower limits than the organization's, for one noisy client |
-| IP allowlist | Up to 32 addresses or CIDR ranges; calls from elsewhere answer `403 IP_NOT_ALLOWED` |
+| IP allowlist | Up to 32 addresses or CIDR ranges. Calls from elsewhere answer `403 IP_NOT_ALLOWED` |
 | Expiry | 30, 90, or 365 days, or none |
 
 The organization's own settings apply on top: its model access list, its budget, and its residency region.

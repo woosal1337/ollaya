@@ -9,7 +9,7 @@ order: 22
 
 Every error has the same body as a local Ollaya, `{"error": "<message>", "code": "<CODE>"}`, and the header `X-Ollaya-Error-Code` with the same code. Branch on the code, never on the message: messages may change, codes do not. The TypeSafe SDK raises a typed exception from the status and shows `error` as its message.
 
-Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-9._-]{1,128}`); `/v1/*` responses carry it as `x-typesafe-request-id` too, which the SDK exposes as `request_id`. Quote it when you ask about a request.
+Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-9._-]{1,128}`). `/v1/*` responses carry it as `x-typesafe-request-id` too, which the SDK exposes as `request_id`. Quote it when you ask about a request.
 
 ## Codes
 
@@ -32,12 +32,12 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | `REQUEST_TOO_LARGE` | 413 | The body is larger than 8 MiB, compressed or not | Send a smaller state |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | An unknown content encoding, or more than one | Send `gzip` or `zstd`, or no encoding |
 | `IDEMPOTENCY_KEY_REUSED` | 422 | The `Idempotency-Key` was used with a different request (management API) | Use a new key |
-| `INVALID_REQUEST` | 422 | The body does not validate; `detail` lists each problem, as FastAPI does | Fix the fields named in `detail` |
-| `RATE_LIMITED` | 429 | Over your request rate | Retry after `Retry-After`; the SDK does |
-| `CONCURRENCY_LIMITED` | 429 | Over your concurrent request limit | Retry after `Retry-After`; the SDK does |
-| `INTERNAL` | 500 | An error in Ollaya Cloud itself | Retry; tell us the request ID if it persists |
+| `INVALID_REQUEST` | 422 | The body does not validate. `detail` lists each problem, as FastAPI does | Fix the fields named in `detail` |
+| `RATE_LIMITED` | 429 | Over your request rate | Retry after `Retry-After`. The SDK does |
+| `CONCURRENCY_LIMITED` | 429 | Over your concurrent request limit | Retry after `Retry-After`. The SDK does |
+| `INTERNAL` | 500 | An error in Ollaya Cloud itself | Retry. Tell us the request ID if it persists |
 | `QUEUE_FULL` | 503 | The model is overloaded or not loaded yet, the time in `X-Ollaya-Timeout-Ms` ran out before a worker answered, or Ollaya Cloud cannot read the balance of a new organization yet | Retry after `Retry-After`. The SDK does |
 
-Errors from the model itself (`TOO_MANY_OPTIONS`, `INPUT_TOO_LONG`, `STATE_TRUNCATED`, `INFERENCE_FAILED`, and the rest) pass through with Ollaya's own status and code; see [the API reference](/docs/api#errors). Only a `2xx` answer is billed: no error ever costs anything.
+Errors from the model itself (`TOO_MANY_OPTIONS`, `INPUT_TOO_LONG`, `STATE_TRUNCATED`, `INFERENCE_FAILED`, and the rest) pass through with Ollaya's own status and code. See [the API reference](/docs/api#errors). Only a `2xx` answer is billed: no error ever costs anything.
 
 The request log can show one more code, `USAGE_OUT_OF_BOUNDS`, next to a `2xx` status. It means that the worker reported more input tokens than the request can hold, or a cost too large to record. You got the answer, and the request costs nothing.

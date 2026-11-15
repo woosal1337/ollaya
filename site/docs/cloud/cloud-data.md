@@ -7,18 +7,18 @@ order: 25
 
 # Data handling
 
-**Ollaya Cloud never stores or logs what you send or what it answers.** A state and its answers exist only in memory while the request is answered; no database, log, trace, or metric holds them.
+**Ollaya Cloud never stores or logs what you send or what it answers.** A state and its answers exist only in memory while Ollaya Cloud answers the request. No database, log, trace, or metric holds them.
 
 ## What is kept
 
 For each request, Ollaya Cloud keeps metadata only, which is what the **Usage** and **Requests** pages show:
 
-- the time, request ID, key, endpoint, and region;
-- the model asked for and the model that answered;
-- the status and error code, and the number of questions;
-- input tokens, the price, and the cost;
-- the total, model, and load times;
-- your tags (`X-Ollaya-Tags`) and the SDK name and version it sent.
+- the time, request ID, key, endpoint, and region
+- the model asked for and the model that answered
+- the status and error code, and the number of questions
+- input tokens, the price, and the cost
+- the total, model, and load times
+- your tags (`X-Ollaya-Tags`) and the SDK name and version it sent
 
 ## For how long
 

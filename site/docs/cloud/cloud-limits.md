@@ -19,7 +19,7 @@ Each organization has a request rate (with a burst on top) and a number of reque
 | Tier 3 | 1,000 | 2,000 | 150 |
 | Enterprise | by contract | by contract | by contract |
 
-A key can have lower limits than its organization (see [Keys](/docs/cloud-keys)). Over the rate, a request gets `429 RATE_LIMITED`; over the concurrency, `429 CONCURRENCY_LIMITED`. Both carry `Retry-After` in seconds.
+A key can have lower limits than its organization (see [Keys](/docs/cloud-keys)). Over the rate, a request gets `429 RATE_LIMITED`. Over the concurrency, it gets `429 CONCURRENCY_LIMITED`. Both carry `Retry-After` in seconds.
 
 ## Rate-limit headers
 

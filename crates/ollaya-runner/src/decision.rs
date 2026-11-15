@@ -7,6 +7,9 @@
 //! with 0) to the endpoint head's raw `logits` [rows, k]. A row's first `k_row` logits are its
 //! option logits, plus the row's score offsets and with a noul row's [true, false] swapped back to
 //! [false, true] (Decision 2.0). Rows come from `ollaya_decision::decision`.
+//!
+//! A graph in the fork form takes the rows as a shared prefix and one branch per question instead
+//! of `input_ids` ([`crate::fork`]): the state runs once per request, with the same numbers.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -29,6 +32,14 @@ const MAX_ROWS: usize = 4096;
 /// longer than this runs alone.
 const TOKEN_BUDGET: usize = 8192;
 const INPUTS: [&str; 3] = ["input_ids", "query_pos", "cand_pos"];
+/// The same graph in the fork form ([`crate::fork`]).
+const FORK_INPUTS: [&str; 5] = [
+    "prefix_ids",
+    "branch_ids",
+    "branch_job",
+    "query_pos",
+    "cand_pos",
+];
 const OUTPUT: &str = "logits";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,12 +157,15 @@ impl DecisionModel {
         if let Some(session) = net.session() {
             let session = session.lock().expect("session mutex poisoned");
             let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-            if inputs.len() != INPUTS.len()
-                || !INPUTS.iter().all(|n| inputs.contains(n))
+            let is = |want: &[&str]| {
+                inputs.len() == want.len() && want.iter().all(|n| inputs.contains(n))
+            };
+            if !(is(&INPUTS) || is(&FORK_INPUTS))
                 || !session.outputs().iter().any(|o| o.name() == OUTPUT)
             {
                 return Err(Error::Model(format!(
-                    "graph inputs {inputs:?} do not match the decision contract ({INPUTS:?} -> {OUTPUT:?})"
+                    "graph inputs {inputs:?} do not match the decision contract ({INPUTS:?} or \
+                     {FORK_INPUTS:?} -> {OUTPUT:?})"
                 )));
             }
         }
@@ -188,8 +202,12 @@ impl DecisionModel {
 
     /// Each row's option logits (its first `k_row` graph outputs, plus its offsets, a noul row's as
     /// [false, true]). Rows run shortest first, in batches padded to a multiple of `seq_multiple`.
+    /// A network that forks ([`Decoder::forks`]) runs through [`DecisionModel::fork_logits`].
     pub fn logits(&self, encoding: &DecisionEncoding) -> Result<Vec<Vec<f32>>, Error> {
         let rows = &encoding.rows;
+        if self.net.forks() {
+            return self.fork_logits(rows);
+        }
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| rows[i].ids.len());
         let padded: Vec<usize> = order
@@ -247,18 +265,71 @@ impl DecisionModel {
                 )));
             }
             for (&i, row) in batch.iter().zip(out.rows()) {
-                let r = &rows[i];
-                let mut l: Vec<f32> = row.iter().take(r.cands.len()).copied().collect();
-                for (x, b) in l.iter_mut().zip(&r.offsets) {
-                    *x = (f64::from(*x) + b) as f32;
-                }
-                if r.true_first {
-                    l.swap(0, 1);
-                }
-                logits[i] = l;
+                logits[i] = option_logits(&rows[i], row.iter().copied());
             }
         }
         Ok(logits)
+    }
+
+    /// [`DecisionModel::logits`] in fork runs: each run carries the request's shared prefix once
+    /// and the questions as branches; read positions stay the rows' own.
+    fn fork_logits(&self, rows: &[DecisionRow]) -> Result<Vec<Vec<f32>>, Error> {
+        let ids: Vec<&[u32]> = rows.iter().map(|r| r.ids.as_slice()).collect();
+        let runs = crate::fork::runs(
+            &ids,
+            self.seq_multiple,
+            self.layout.pad,
+            TOKEN_BUDGET,
+            MAX_ROWS,
+        );
+        let positions = |run: &[usize]| {
+            let k = run.iter().map(|&i| rows[i].cands.len()).max().unwrap_or(0);
+            let mut query_pos = Array1::<i64>::zeros(run.len());
+            let mut cand_pos = Array2::<i64>::zeros((run.len(), k));
+            for (r, &i) in run.iter().enumerate() {
+                query_pos[r] = rows[i].query as i64;
+                for (c, &p) in rows[i].cands.iter().enumerate() {
+                    cand_pos[[r, c]] = p as i64;
+                }
+            }
+            (query_pos, cand_pos)
+        };
+        let out = match &self.net {
+            Decoder::Ort(session) => {
+                let reads = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+                    let (query_pos, cand_pos) = positions(run);
+                    Ok(vec![
+                        (
+                            "query_pos".into(),
+                            ort::value::Tensor::from_array(query_pos)?.into(),
+                        ),
+                        (
+                            "cand_pos".into(),
+                            ort::value::Tensor::from_array(cand_pos)?.into(),
+                        ),
+                    ])
+                };
+                crate::fork::outputs(session, runs, TOKEN_BUDGET, self.device, OUTPUT, reads)?
+            }
+            #[cfg(feature = "mlx")]
+            Decoder::Mlx(mlx) => crate::fork::each(runs, |run| {
+                let (query_pos, cand_pos) = positions(&run.rows);
+                mlx.endpoint_fork(&run, query_pos.as_slice().unwrap(), &cand_pos)
+            })?,
+        };
+        rows.iter()
+            .zip(out)
+            .map(|(row, l)| {
+                if l.len() < row.cands.len() {
+                    return Err(Error::Model(format!(
+                        "{OUTPUT} has {} logits for {} options",
+                        l.len(),
+                        row.cands.len()
+                    )));
+                }
+                Ok(option_logits(row, l))
+            })
+            .collect()
     }
 
     /// The request's output from each row's option logits.
@@ -276,6 +347,19 @@ impl DecisionModel {
             state_truncated: false,
         }
     }
+}
+
+/// A row's option logits from its graph output: the first `k_row` entries, plus the row's
+/// offsets, a noul row's as [false, true].
+fn option_logits(row: &DecisionRow, out: impl IntoIterator<Item = f32>) -> Vec<f32> {
+    let mut l: Vec<f32> = out.into_iter().take(row.cands.len()).collect();
+    for (x, b) in l.iter_mut().zip(&row.offsets) {
+        *x = (f64::from(*x) + b) as f32;
+    }
+    if row.true_first {
+        l.swap(0, 1);
+    }
+    l
 }
 
 #[cfg(test)]

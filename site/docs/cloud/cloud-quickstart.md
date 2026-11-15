@@ -11,7 +11,7 @@ Ollaya Cloud runs Ollaya's own decision models for you: the same `/v1/*` API as 
 
 ## 1. Create a key
 
-Sign in at **{{SITE_HOST}}/dashboard** with your email, Google, or GitHub. A new account gets its own organization. Open **Keys**, choose **Create key**, and copy the key: it starts with `oly_live_` and is shown only once.
+Sign in at **{{SITE_HOST}}/dashboard** with a code that Ollaya Cloud sends to your email address. Later you can also sign in with a passkey, add two-step verification, or use your company's single sign-on. A new account gets its own organization with $1 of welcome credit for 30 days. Each email address gets the welcome credit once, and a disposable address gets none. Open **API keys**, choose **Create key**, and copy the key: it starts with `oly_live_` and is shown only once.
 
 ## 2. Point the SDK at Ollaya Cloud
 
@@ -53,7 +53,7 @@ The answer has exactly `model`, `answers`, and `usage`, as TypeSafe's does. `usa
 
 ## 4. See it in the dashboard
 
-**Usage** shows the request within a few seconds, with its cost; **Requests** lists it by its request ID (never its content, which Ollaya Cloud does not store); **Credits** shows the balance it came out of.
+**Requests** lists the request within a few seconds, by its request ID and with its cost. It never shows the content, because Ollaya Cloud does not store it. **Usage** adds the request to its hourly charts within five minutes, and to its daily charts within an hour. **Credits** shows the balance it came out of.
 
 ## Next
 

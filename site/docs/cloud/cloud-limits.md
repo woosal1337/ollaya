@@ -23,14 +23,14 @@ A key can have lower limits than its organization (see [Keys](/docs/cloud-keys))
 
 ## Rate-limit headers
 
-Answers carry the IETF rate-limit fields (`draft-ietf-httpapi-ratelimit-headers`, revision 11):
+Answers to decisions carry the IETF rate-limit fields (`draft-ietf-httpapi-ratelimit-headers`, revision 11):
 
 ```http
 RateLimit-Policy: "rate";q=10;w=2, "concurrent";q=2;qu="concurrent-requests"
 RateLimit: "rate";r=9;t=1
 ```
 
-`RateLimit-Policy` describes your limits: the burst `q` and the seconds `w` to refill it, and the concurrent requests. `RateLimit` says what is left: `r` requests, and `t` seconds until the burst is full again.
+`RateLimit-Policy` describes your limits: the burst `q` and the seconds `w` to refill it, and the concurrent requests. `RateLimit` says what is left: `r` requests, and `t` seconds until the burst is full again. An Enterprise organization without agreed limits has no limits, so its answers carry neither field.
 
 ## Overload
 
@@ -38,11 +38,11 @@ When a model's replicas are busy enough that a request would wait longer than yo
 
 ## Retries
 
-The TypeSafe SDK retries `429` and `503` after `Retry-After`, and `5xx` answers, so most clients need nothing more. Decisions are idempotent: retrying one is always safe, and only the answer you receive is billed. Ollaya Cloud itself retries an attempt that failed in the worker once on another replica, within a retry budget, before you see an error.
+The TypeSafe SDK retries `429` and `503` after `Retry-After`, and `5xx` answers, so most clients need nothing more. Decisions are idempotent, so a retry is always safe. Ollaya Cloud bills a `2xx` answer when it sends it, even if the answer does not reach you. Ollaya Cloud itself retries an attempt that failed in the worker once on another replica, within a retry budget, before you see an error.
 
 ## Deadlines
 
-Send `X-Ollaya-Timeout-Ms: <milliseconds>` with a decision to say how long you will wait. Ollaya Cloud refuses at once (`503 QUEUE_FULL`) a request it could not answer in time, and cuts each attempt to that many milliseconds, instead of answering after you have given up.
+Send `X-Ollaya-Timeout-Ms: <milliseconds>` with a decision to say how long you will wait. Ollaya Cloud refuses at once (`503 QUEUE_FULL`) a request it could not answer in time, and cuts each attempt to that many milliseconds, instead of answering after you have given up. When the time runs out before a worker answers, for example while the request waits in a worker's queue, the answer is also `503 QUEUE_FULL`, with `Retry-After: 1`.
 
 ## Tags
 

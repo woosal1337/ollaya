@@ -134,13 +134,6 @@ impl DecisionModel {
 
         let weights = config.weights_in_memory;
         let net = match device {
-            // MLX runs Decision 1.0's Qwen3.5 backbone only.
-            Device::Metal if config.layout != LAYOUTS[0] => {
-                return Err(Error::Model(format!(
-                    "layout {} does not run on Metal yet",
-                    config.layout
-                )));
-            }
             Device::Metal => Decoder::metal(files, Head::Endpoint)?,
             _ => Decoder::Ort(Mutex::new(session_for(
                 &files.graph,
@@ -154,6 +147,13 @@ impl DecisionModel {
                 |b| weights.configure(crate::decider::configure(b, device)?),
             )?)),
         };
+        // MLX runs the Qwen3.5 backbones (the ones that fork) only: Kai's Qwen3 has no Metal gate.
+        if matches!(device, Device::Metal) && !net.forks() {
+            return Err(Error::Model(format!(
+                "layout {}: only Qwen3.5 backbones run on Metal",
+                config.layout
+            )));
+        }
         if let Some(session) = net.session() {
             let session = session.lock().expect("session mutex poisoned");
             let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();

@@ -226,20 +226,28 @@ impl DeciderModel {
             .max()
             .unwrap_or(0)
             .max(2);
-        if let Decoder::Ort(session) = &self.net
-            && crate::fork::is_fork(session)
-        {
-            let slots = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
-                let slot_pos: Array1<i64> = run.iter().map(|&i| rows[i].len() as i64 - 1).collect();
-                Ok(vec![(
-                    "slot_pos".into(),
-                    ort::value::Tensor::from_array(slot_pos)?.into(),
-                )])
+        if self.net.forks() {
+            let slot_pos = |run: &[usize]| -> Array1<i64> {
+                run.iter().map(|&i| rows[i].len() as i64 - 1).collect()
             };
             let pad = self.layout.special_tokens.pad;
             let runs = crate::fork::runs(&rows, self.seq_multiple, pad, TOKEN_BUDGET, MAX_ROWS);
-            let logits =
-                crate::fork::outputs(session, runs, TOKEN_BUDGET, self.device, OUTPUT, slots)?;
+            let logits = match &self.net {
+                Decoder::Ort(session) => {
+                    let slots = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+                        Ok(vec![(
+                            "slot_pos".into(),
+                            ort::value::Tensor::from_array(slot_pos(run))?.into(),
+                        )])
+                    };
+                    crate::fork::outputs(session, runs, TOKEN_BUDGET, self.device, OUTPUT, slots)?
+                }
+                #[cfg(feature = "mlx")]
+                Decoder::Mlx(mlx) => crate::fork::each(runs, |run| {
+                    let slots = slot_pos(&run.rows);
+                    mlx.tied_rows_fork(&run, slots.as_slice().unwrap(), &self.layout.labels.ids)
+                })?,
+            };
             if let Some(short) = logits.iter().find(|l| l.len() < width) {
                 return Err(Error::Model(format!(
                     "{OUTPUT} has {} labels for up to {width} options",

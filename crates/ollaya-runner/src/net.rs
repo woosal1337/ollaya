@@ -119,6 +119,16 @@ impl Decoder {
             Decoder::Mlx(_) => None,
         }
     }
+
+    /// Whether the network takes fork runs ([`crate::fork`]): a graph in the fork form, or an MLX
+    /// Qwen3.5 backbone, which computes from the weights whatever form the graph has.
+    pub fn forks(&self) -> bool {
+        match self {
+            Decoder::Ort(s) => crate::fork::is_fork(s),
+            #[cfg(feature = "mlx")]
+            Decoder::Mlx(m) => m.forks(),
+        }
+    }
 }
 
 impl Net {

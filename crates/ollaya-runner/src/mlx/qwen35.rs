@@ -17,7 +17,7 @@
 //! * Softplus is `max(x, 0) + log1p(exp(-|x|))`, the stable form, within rounding of torch's
 //!   thresholded one.
 
-use ollaya_mlx::Array;
+use ollaya_mlx::{Array, Dtype};
 
 use super::arch::Qwen35Config;
 use super::modernbert::{Linear, rotate, silu};
@@ -175,17 +175,38 @@ impl DeltaNet {
 
     /// `h` [rows, seq, hidden] with `seq` a multiple of [`CHUNK`]: [rows, seq, hidden].
     fn forward(&self, h: &Array, masks: &ChunkMasks) -> Result<Array> {
+        Ok(self.run(h, masks, None, None)?.0)
+    }
+
+    /// [`DeltaNet::forward`] for a row that continues another: `before` [rows, kernel - 1, conv]
+    /// holds the conv inputs of the tokens ahead of it and `state` [rows, v_heads, dk, dv] the
+    /// recurrent state there (zeros when `None`). Also returns this row's own last kernel - 1 conv
+    /// inputs and its final state, for rows that continue it.
+    fn run(
+        &self,
+        h: &Array,
+        masks: &ChunkMasks,
+        before: Option<&Array>,
+        state: Option<&Array>,
+    ) -> Result<(Array, Array, Array)> {
         let shape = h.shape();
         let (rows, seq) = (shape[0], shape[1]);
         let (hk, hv, dk, dv) = (self.k_heads, self.v_heads, self.dk, self.dv);
         let conv_dim = 2 * hk * dk + hv * dv;
-        // The depthwise causal conv: pad both sides by kernel - 1, keep the first seq outputs.
-        let mixed = self
-            .qkv
-            .forward(h)?
-            .conv1d(&self.conv, self.kernel - 1, conv_dim)
-            .and_then(|m| m.slice(&[0, 0, 0], &[rows, seq, conv_dim]))
+        let projected = self.qkv.forward(h)?;
+        let tail = projected
+            .slice(&[0, seq - (self.kernel - 1), 0], &[rows, seq, conv_dim])
             .map_err(mlx)?;
+        // The depthwise causal conv: pad both sides by kernel - 1 and keep the first seq outputs,
+        // or read the inputs ahead of the row instead of the left padding.
+        let mixed = match before {
+            None => projected
+                .conv1d(&self.conv, self.kernel - 1, conv_dim)
+                .and_then(|m| m.slice(&[0, 0, 0], &[rows, seq, conv_dim])),
+            Some(b) => Array::concatenate(&[b, &projected], 1)
+                .and_then(|m| m.conv1d(&self.conv, 0, conv_dim)),
+        }
+        .map_err(mlx)?;
         let mixed = silu(&mixed)?;
         let part = |from: i32, to: i32, heads: i32, dim: i32| {
             mixed
@@ -217,7 +238,8 @@ impl DeltaNet {
             .multiply(&self.neg_a)
             .and_then(|g| g.transpose(&[0, 2, 1]))
             .map_err(mlx)?;
-        let core = gated_delta_rule(&q, &k, &v, &g, &beta, masks)?; // [rows, v_heads, seq, dv]
+        // [rows, v_heads, seq, dv]
+        let (core, last) = gated_delta_rule(&q, &k, &v, &g, &beta, masks, state)?;
         let core = core
             .transpose(&[0, 2, 1, 3])
             .and_then(|a| a.reshape(&[rows, seq, hv, dv]))
@@ -234,12 +256,13 @@ impl DeltaNet {
             .and_then(|n| n.multiply(&gate))
             .and_then(|n| n.reshape(&[rows, seq, hv * dv]))
             .map_err(mlx)?;
-        self.out.forward(&normed)
+        Ok((self.out.forward(&normed)?, tail, last))
     }
 }
 
 /// `gated_delta_rule` of the export trunk: q, k [B, H, T, dk], v [B, H, T, dv], g and beta
-/// [B, H, T], T a multiple of [`CHUNK`]. Returns [B, H, T, dv].
+/// [B, H, T], T a multiple of [`CHUNK`], from `initial` [B, H, dk, dv] (zeros when `None`).
+/// Returns the output [B, H, T, dv] and the final state.
 fn gated_delta_rule(
     q: &Array,
     k: &Array,
@@ -247,7 +270,8 @@ fn gated_delta_rule(
     g: &Array,
     beta: &Array,
     masks: &ChunkMasks,
-) -> Result<Array> {
+    initial: Option<&Array>,
+) -> Result<(Array, Array)> {
     let shape = k.shape();
     let (b, h, t, dk) = (shape[0], shape[1], shape[2], shape[3]);
     let dv = v.shape()[3];
@@ -309,7 +333,10 @@ fn gated_delta_rule(
         .map_err(mlx)?;
 
     // The recurrence over chunks, [B, H, dk, dv] state.
-    let mut state = Array::full(&[b, h, dk, dv], 0.0).map_err(mlx)?;
+    let mut state = match initial {
+        Some(s) => s.clone(),
+        None => Array::full(&[b, h, dk, dv], 0.0).map_err(mlx)?,
+    };
     let mut outs = Vec::with_capacity(n as usize);
     let at = |a: &Array, i: i32, d: i32| {
         a.slice(&[0, 0, i, 0, 0], &[b, h, i + 1, CHUNK, d])
@@ -345,7 +372,7 @@ fn gated_delta_rule(
         outs.push(out);
     }
     let refs: Vec<&Array> = outs.iter().collect();
-    Array::concatenate(&refs, 2).map_err(mlx)
+    Ok((Array::concatenate(&refs, 2).map_err(mlx)?, state))
 }
 
 /// `Qwen3_5Attention`: gated full attention with partial RoPE.
@@ -388,6 +415,24 @@ impl Attention {
         sin: &Array,
         mask: &Array,
     ) -> Result<Array> {
+        Ok(self.run(h, heads, kv_heads, hd, cos, sin, mask, None)?.0)
+    }
+
+    /// [`Attention::forward`] for a row that continues another: `past` holds the keys and values
+    /// [rows, kv_heads, P, hd] ahead of it, which `mask` [.., seq, P + seq] covers. Also returns
+    /// this row's own keys and values.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        h: &Array,
+        heads: i32,
+        kv_heads: i32,
+        hd: i32,
+        cos: &Array,
+        sin: &Array,
+        mask: &Array,
+        past: Option<(&Array, &Array)>,
+    ) -> Result<(Array, Array, Array)> {
         let shape = h.shape();
         let (rows, seq) = (shape[0], shape[1]);
         let rd = cos.shape()[1];
@@ -430,6 +475,14 @@ impl Attention {
             .reshape(&[rows, seq, kv_heads, hd])
             .and_then(|a| a.transpose(&[0, 2, 1, 3]))
             .map_err(mlx)?;
+        let own = (k.clone(), v.clone());
+        let (k, v) = match past {
+            Some((pk, pv)) => (
+                Array::concatenate(&[pk, &k], 2).map_err(mlx)?,
+                Array::concatenate(&[pv, &v], 2).map_err(mlx)?,
+            ),
+            None => (k, v),
+        };
         let rep = heads / kv_heads;
         let (k, v) = if rep > 1 {
             (
@@ -444,7 +497,7 @@ impl Attention {
             .and_then(|a| a.reshape(&[rows, seq, heads * hd]))
             .and_then(|a| a.multiply(&gate.sigmoid()?))
             .map_err(mlx)?;
-        self.o.forward(&attn)
+        Ok((self.o.forward(&attn)?, own.0, own.1))
     }
 }
 
@@ -548,5 +601,67 @@ impl Qwen35 {
                 .map_err(mlx)?;
         }
         self.final_norm.forward(&x)
+    }
+
+    /// [`Qwen35::forward`] of the rows `prefix[job[b]] ++ branch[b]` (`crate::fork`): prefix
+    /// [J, P] and branch [B, S] ids, both multiples of [`CHUNK`], `job` [B] int32. Every prefix runs
+    /// once; each branch continues its prefix's DeltaNet state, conv window and attention keys, so
+    /// the chunks are the rows'. Returns the rows' hidden states [B, P + S, hidden].
+    pub fn fork(&self, prefix: &Array, branch: &Array, job: &Array) -> Result<Array> {
+        let (p, s) = (prefix.shape()[1], branch.shape()[1]);
+        if p % CHUNK != 0 || s % CHUNK != 0 {
+            return Err(Error::Model(format!(
+                "Qwen3.5 prefixes and branches must be multiples of {CHUNK} tokens, got {p} and {s}"
+            )));
+        }
+        let (cos, sin) = self.rotary.get(p + s)?;
+        let d = cos.shape()[1];
+        let rows = |a: &Array, from: i32, to: i32| a.slice(&[from, 0], &[to, d]).map_err(mlx);
+        let (cos_p, sin_p) = (rows(&cos, 0, p)?, rows(&sin, 0, p)?);
+        let (cos_b, sin_b) = (rows(&cos, p, p + s)?, rows(&sin, p, p + s)?);
+        let mask_p = causal_mask(p)?;
+        // branch query i sits at P + i: it sees keys 0..=P + i
+        let mask_b = Array::full(&[s, p + s], 1.0)
+            .and_then(|m| m.tril(p))
+            .and_then(|m| m.astype(Dtype::Bool))
+            .and_then(|m| m.reshape(&[1, 1, s, p + s]))
+            .map_err(mlx)?;
+        let of_job = |a: &Array| a.take(job, 0).map_err(mlx);
+        let (heads, kv, hd) = (self.heads, self.kv_heads, self.head_dim);
+        let mut xp = self.embed.take(prefix, 0).map_err(mlx)?;
+        let mut xb = self.embed.take(branch, 0).map_err(mlx)?;
+        for layer in &self.layers {
+            let (np, nb) = (
+                layer.input_norm.forward(&xp)?,
+                layer.input_norm.forward(&xb)?,
+            );
+            let (mp, mb) = match &layer.mixer {
+                Mixer::Linear(m) => {
+                    let (out, tail, state) = m.run(&np, &self.masks, None, None)?;
+                    let (tail, state) = (of_job(&tail)?, of_job(&state)?);
+                    (out, m.run(&nb, &self.masks, Some(&tail), Some(&state))?.0)
+                }
+                Mixer::Full(a) => {
+                    let (out, k, v) = a.run(&np, heads, kv, hd, &cos_p, &sin_p, &mask_p, None)?;
+                    let (k, v) = (of_job(&k)?, of_job(&v)?);
+                    let past = Some((&k, &v));
+                    (
+                        out,
+                        a.run(&nb, heads, kv, hd, &cos_b, &sin_b, &mask_b, past)?.0,
+                    )
+                }
+            };
+            xp = xp.add(&mp).map_err(mlx)?;
+            xp = xp
+                .add(&layer.mlp.forward(&layer.post_norm.forward(&xp)?)?)
+                .map_err(mlx)?;
+            xb = xb.add(&mb).map_err(mlx)?;
+            xb = xb
+                .add(&layer.mlp.forward(&layer.post_norm.forward(&xb)?)?)
+                .map_err(mlx)?;
+        }
+        let hp = of_job(&self.final_norm.forward(&xp)?)?;
+        let hb = self.final_norm.forward(&xb)?;
+        Array::concatenate(&[&hp, &hb], 1).map_err(mlx)
     }
 }

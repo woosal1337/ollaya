@@ -15,7 +15,6 @@ use std::sync::Mutex;
 use ndarray::{Array1, Array2, Ix2};
 use ollaya_decision::kev::{KevLayout, KevRow, KevState};
 use ollaya_decision::{Calibration, CalibrationFile, Questions, TokenEncoder};
-use ort::session::Session;
 use ort::session::builder::SessionBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -211,8 +210,8 @@ impl KevModel {
 
 /// Each row's option scores from a pointer graph (`input_ids`, `decide_pos`, `opt_pos` -> `scores`):
 /// its first `k_row` outputs. Rows run shortest first, in batches padded to a multiple of
-/// `seq_multiple`. Shared by the pointer layouts (`kev`, `strands`). A graph in the fork form runs
-/// through [`fork_scores`].
+/// `seq_multiple`. Shared by the pointer layouts (`kev`, `strands`). A network that forks
+/// ([`Decoder::forks`]) runs through [`fork_scores`].
 pub(crate) fn pointer_scores(
     net: &Decoder,
     rows: &[KevRow],
@@ -220,10 +219,8 @@ pub(crate) fn pointer_scores(
     pad: u32,
     device: Device,
 ) -> Result<Vec<Vec<f32>>, Error> {
-    if let Decoder::Ort(session) = net
-        && crate::fork::is_fork(session)
-    {
-        return fork_scores(session, rows, seq_multiple, pad, device);
+    if net.forks() {
+        return fork_scores(net, rows, seq_multiple, pad, device);
     }
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by_key(|&i| rows[i].ids.len());
@@ -288,10 +285,10 @@ pub(crate) fn pointer_scores(
     Ok(scores)
 }
 
-/// [`pointer_scores`] for a graph in the fork form: each run carries the request's shared prefix
-/// once and the questions as branches; read positions stay the rows' own.
+/// [`pointer_scores`] in fork runs: each run carries the request's shared prefix once and the
+/// questions as branches; read positions stay the rows' own.
 fn fork_scores(
-    session: &Mutex<Session>,
+    net: &Decoder,
     rows: &[KevRow],
     seq_multiple: usize,
     pad: u32,
@@ -299,7 +296,7 @@ fn fork_scores(
 ) -> Result<Vec<Vec<f32>>, Error> {
     let ids: Vec<&[u32]> = rows.iter().map(|r| r.ids.as_slice()).collect();
     let runs = crate::fork::runs(&ids, seq_multiple, pad, TOKEN_BUDGET, MAX_ROWS);
-    let reads = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+    let positions = |run: &[usize]| {
         let k = run.iter().map(|&i| rows[i].opts.len()).max().unwrap_or(0);
         let mut decide_pos = Array1::<i64>::zeros(run.len());
         let mut opt_pos = Array2::<i64>::zeros((run.len(), k));
@@ -309,18 +306,31 @@ fn fork_scores(
                 opt_pos[[r, c]] = p as i64;
             }
         }
-        Ok(vec![
-            (
-                "decide_pos".into(),
-                ort::value::Tensor::from_array(decide_pos)?.into(),
-            ),
-            (
-                "opt_pos".into(),
-                ort::value::Tensor::from_array(opt_pos)?.into(),
-            ),
-        ])
+        (decide_pos, opt_pos)
     };
-    let scores = crate::fork::outputs(session, runs, TOKEN_BUDGET, device, OUTPUT, reads)?;
+    let scores = match net {
+        Decoder::Ort(session) => {
+            let reads = |run: &[usize]| -> Result<Vec<crate::fork::Input>, Error> {
+                let (decide_pos, opt_pos) = positions(run);
+                Ok(vec![
+                    (
+                        "decide_pos".into(),
+                        ort::value::Tensor::from_array(decide_pos)?.into(),
+                    ),
+                    (
+                        "opt_pos".into(),
+                        ort::value::Tensor::from_array(opt_pos)?.into(),
+                    ),
+                ])
+            };
+            crate::fork::outputs(session, runs, TOKEN_BUDGET, device, OUTPUT, reads)?
+        }
+        #[cfg(feature = "mlx")]
+        Decoder::Mlx(mlx) => crate::fork::each(runs, |run| {
+            let (decide_pos, opt_pos) = positions(&run.rows);
+            mlx.endpoint_fork(&run, decide_pos.as_slice().unwrap(), &opt_pos)
+        })?,
+    };
     rows.iter()
         .zip(scores)
         .map(|(row, s)| {

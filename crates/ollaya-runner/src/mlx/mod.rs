@@ -24,6 +24,7 @@ use ollaya_mlx::{Array, MetalInfo, Worker};
 use self::arch::{Arch, Backbone, Head};
 use self::weights::{Tensors, mlx};
 use crate::Error;
+use crate::fork::Run;
 use crate::net::{Batch, Head as HeadKind};
 use crate::onnx::ModelFiles;
 
@@ -418,10 +419,75 @@ fn pad_rows(ids: Vec<i32>, rows: usize, seq: usize, multiple: usize) -> (Vec<i32
     (out, padded)
 }
 
+/// The token ids of one decoder pass, owned so they can go to the MLX thread.
+enum Pass {
+    /// Rows [rows, seq], right-padded.
+    Rows {
+        ids: Vec<i32>,
+        rows: usize,
+        seq: usize,
+    },
+    /// A fork run ([`crate::fork`]): prefixes [J, P], branches [B, S] and each branch's prefix.
+    Fork {
+        prefix: (Vec<i32>, [i32; 2]),
+        branch: (Vec<i32>, [i32; 2]),
+        job: Vec<i32>,
+    },
+}
+
+impl Pass {
+    fn rows(ids: &Array2<i64>) -> Pass {
+        let (rows, seq) = ids.dim();
+        Pass::Rows {
+            ids: ids.iter().map(|&v| v as i32).collect(),
+            rows,
+            seq,
+        }
+    }
+
+    fn fork(run: &Run) -> Pass {
+        let owned = |a: &Array2<i64>| {
+            let (r, c) = a.dim();
+            (a.iter().map(|&v| v as i32).collect(), [r as i32, c as i32])
+        };
+        Pass::Fork {
+            prefix: owned(&run.prefix_ids),
+            branch: owned(&run.branch_ids),
+            job: run.branch_job.iter().map(|&v| v as i32).collect(),
+        }
+    }
+
+    /// The final hidden states of every row, [rows, seq, hidden] (a fork run's rows are its
+    /// prefix, then its branch).
+    fn hidden(self, m: &DecoderModel) -> Result<Array, Error> {
+        match self {
+            Pass::Rows { ids, rows, seq } => {
+                let (ids, padded) = pad_rows(ids, rows, seq, m.backbone.seq_multiple() as usize);
+                let ids = Array::from_slice(&ids, &[rows as i32, padded as i32]).map_err(mlx)?;
+                m.backbone.forward(&ids)
+            }
+            Pass::Fork {
+                prefix,
+                branch,
+                job,
+            } => {
+                let DecoderBackbone::Qwen35(q) = &m.backbone else {
+                    return Err(Error::Model("only Qwen3.5 backbones fork".into()));
+                };
+                let prefix = Array::from_slice(&prefix.0, &prefix.1).map_err(mlx)?;
+                let branch = Array::from_slice(&branch.0, &branch.1).map_err(mlx)?;
+                let job = Array::from_slice(&job, &[job.len() as i32]).map_err(mlx)?;
+                q.fork(&prefix, &branch, &job)
+            }
+        }
+    }
+}
+
 /// A decoder network (qwen3guard) on the MLX thread: rows of token ids in, the tied LM head at one
 /// position per row out.
 pub struct MlxDecoder {
     worker: Worker<DecoderModel>,
+    fork: bool,
 }
 
 impl MlxDecoder {
@@ -440,6 +506,7 @@ impl MlxDecoder {
             )));
         }
         let (paths, dir) = (files.weights.clone(), arch_dir(arch_path));
+        let fork = matches!(arch.backbone, Backbone::Qwen35(_));
         let metallib = metallib().map_err(Error::Model)?;
         let worker = Worker::start("ollaya-mlx", &metallib, move || {
             let t = Tensors::open(&paths, &dir, &arch.weights)
@@ -475,11 +542,16 @@ impl MlxDecoder {
             load().map_err(|e| ollaya_mlx::Error(e.to_string()))
         })
         .map_err(mlx)?;
-        Ok(MlxDecoder { worker })
+        Ok(MlxDecoder { worker, fork })
     }
 
     pub fn info(&self) -> &MetalInfo {
         self.worker.info()
+    }
+
+    /// Whether the backbone runs fork runs ([`crate::fork`]): Qwen3.5.
+    pub fn forks(&self) -> bool {
+        self.fork
     }
 
     /// The tied LM head at `pos[r]` of each row of `ids` [rows, seq] (right-padded), restricted to
@@ -490,8 +562,21 @@ impl MlxDecoder {
         pos: &[i64],
         tokens: &[u32],
     ) -> Result<Array2<f32>, Error> {
-        let (rows, seq) = ids.dim();
-        let ids: Vec<i32> = ids.iter().map(|&v| v as i32).collect();
+        self.tied(Pass::rows(ids), pos, tokens)
+    }
+
+    /// [`MlxDecoder::tied_rows`] of a fork run: `pos` counts from the start of each row.
+    pub fn tied_rows_fork(
+        &self,
+        run: &Run,
+        pos: &[i64],
+        tokens: &[u32],
+    ) -> Result<Array2<f32>, Error> {
+        self.tied(Pass::fork(run), pos, tokens)
+    }
+
+    fn tied(&self, pass: Pass, pos: &[i64], tokens: &[u32]) -> Result<Array2<f32>, Error> {
+        let rows = pos.len();
         let pos: Vec<i32> = pos.iter().map(|&v| v as i32).collect();
         let tokens: Vec<i32> = tokens.iter().map(|&v| v as i32).collect();
         let width = tokens.len();
@@ -502,13 +587,9 @@ impl MlxDecoder {
                     if !matches!(m.head, DecoderHead::TiedRows) {
                         return Err(Error::Model("this model's head is not tied-rows".into()));
                     }
-                    let (ids, padded) =
-                        pad_rows(ids, rows, seq, m.backbone.seq_multiple() as usize);
-                    let ids =
-                        Array::from_slice(&ids, &[rows as i32, padded as i32]).map_err(mlx)?;
                     let pos = Array::from_slice(&pos, &[rows as i32]).map_err(mlx)?;
                     let tokens = Array::from_slice(&tokens, &[width as i32]).map_err(mlx)?;
-                    let h = m.backbone.forward(&ids)?;
+                    let h = pass.hidden(m)?;
                     qwen3::tied_rows(&h, m.backbone.embed(), &pos, &tokens)?
                         .to_f32_vec()
                         .map_err(mlx)
@@ -528,22 +609,35 @@ impl MlxDecoder {
         query_pos: &[i64],
         cand_pos: &Array2<i64>,
     ) -> Result<Array2<f32>, Error> {
-        let (rows, seq) = ids.dim();
-        let k = cand_pos.ncols();
-        let ids: Vec<i32> = ids.iter().map(|&v| v as i32).collect();
+        self.scored(Pass::rows(ids), query_pos, cand_pos)
+    }
+
+    /// [`MlxDecoder::endpoint`] of a fork run: positions count from the start of each row.
+    pub fn endpoint_fork(
+        &self,
+        run: &Run,
+        query_pos: &[i64],
+        cand_pos: &Array2<i64>,
+    ) -> Result<Array2<f32>, Error> {
+        self.scored(Pass::fork(run), query_pos, cand_pos)
+    }
+
+    fn scored(
+        &self,
+        pass: Pass,
+        query_pos: &[i64],
+        cand_pos: &Array2<i64>,
+    ) -> Result<Array2<f32>, Error> {
+        let (rows, k) = cand_pos.dim();
         let query_pos: Vec<i32> = query_pos.iter().map(|&v| v as i32).collect();
         let cand_pos: Vec<i32> = cand_pos.iter().map(|&v| v as i32).collect();
         let data = self
             .worker
             .run(move |m| {
                 let r = || -> Result<Vec<f32>, Error> {
-                    let (ids, padded) =
-                        pad_rows(ids, rows, seq, m.backbone.seq_multiple() as usize);
-                    let ids =
-                        Array::from_slice(&ids, &[rows as i32, padded as i32]).map_err(mlx)?;
                     let q = Array::from_slice(&query_pos, &[rows as i32]).map_err(mlx)?;
                     let c = Array::from_slice(&cand_pos, &[rows as i32, k as i32]).map_err(mlx)?;
-                    let h = m.backbone.forward(&ids)?;
+                    let h = pass.hidden(m)?;
                     match &m.head {
                         DecoderHead::Endpoint(head) => head.forward(&h, &q, &c)?,
                         DecoderHead::Pointer(head) => head.forward(&h, &q, &c)?,

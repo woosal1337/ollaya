@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted for the ONNX graphs of `kev` and `decider`. The other families, MLX and llama.cpp are follow-ups (see
-Consequences).
+Accepted for `kev` and `decider`, in their ONNX graphs and on MLX. The other families and llama.cpp are follow-ups
+(see Consequences).
 
 ## Date
 
@@ -68,6 +68,16 @@ requests on one development machine (an Apple M5, CPU, `bench --ids td/`), not a
 The gain grows with the state: short one-line states save little, long ones approach one state per request instead
 of one per question.
 
+The MLX fork (`Qwen35::fork`) on Metal, on an Apple M5 with 24 GB: parity against the same goldens, and latency of
+the same 40 typed-decisions requests (`bench --ids td/ --warmup 3 --full-only`). The row path is the same build with
+the fork turned off. Memory is the peak memory footprint of the process (`/usr/bin/time -l`). The resident set size
+on macOS does not count the buffers of MLX.
+
+| Model | Decisions the same | Max logit difference | p50, row → fork | p95, row → fork | Memory, row → fork |
+|---|---:|---:|---|---|---|
+| kev:0.8b | 580 of 580 | 3.6e-5 | 1,155 → 585 ms | 1,863 → 789 ms | 5.6 → 4.7 GiB |
+| decider:0.8b | 579 of 579 | 4.2e-5 | 2,744 → 1,123 ms | 4,251 → 1,741 ms | 6.0 → 5.4 GiB |
+
 ## Consequences
 
 - A family moves to the fork form with its export and its runner, and ships after its gate on CUDA and the CPU, as
@@ -76,8 +86,10 @@ of one per question.
 - Still in the row form: `nimble` and `jeeves` (converted on a branch, waiting for a 9B gate), `decision`,
   `decision2`, `d3`, `strands`, `arbiter` and `decider-vision`. Attention-only trunks (Qwen3, Gemma) need only the
   keys and values.
-- The MLX engine computes from the weights, not the graph, so it needs its own fork (`mlx/qwen35.rs`) and its own
-  parity run on Metal before it can take this path.
+- The MLX engine computes from the weights, not the graph, so it has its own fork (`Qwen35::fork` in
+  `mlx/qwen35.rs`). On MLX, `kev` and `decider` fork whenever the backbone is Qwen3.5 (`Decoder::forks`), whatever
+  the form of the installed graph. kev:0.8b and decider:0.8b pass their gate on Metal with the fork (Results). Their
+  larger tags have no Metal run with the fork yet.
 - llama.cpp can fork a recurrent cache (`llama_memory_seq_cp` copies the state on write), but that changes the
   model's batch split, which moves its numbers away from the goldens of the authors' client. That needs its own
   decision.

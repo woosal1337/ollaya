@@ -2,11 +2,16 @@
 
     uv run python -m ollaya_convert.families.decision.export decision-eos --out out/decision-eos-0.8b [--root SNAPSHOT]
 
-Graph (layout `decision-endpoint-v1`, see layout.py and docs/families/decision.md):
-    inputs   input_ids  int64   [rows, seq]  one row per question; seq a multiple of 64, right-padded
-             query_pos  int64   [rows]       position of the row's last token (the end of "Decision:")
-             cand_pos   int64   [rows, k]    position of each option segment's last token (pad with 0)
-    outputs  logits     float32 [rows, k]    raw candidate logits of the head (temperature not applied)
+Graph (layout `decision-endpoint-v1`, see layout.py and docs/families/decision.md), in the fork form: a question's
+row is its prefix followed by its branch, and every prefix runs once (`Qwen35Trunk.fork`, `qwen35.fork_rows`):
+    inputs   prefix_ids  int64   [J, P]       shared prefixes; P a multiple of 64
+             branch_ids  int64   [B, S]       one branch per question, right-padded; S a multiple of 64
+             branch_job  int64   [B]          the prefix each branch continues
+             query_pos   int64   [B]          position of the row's last token (the end of "Decision:")
+             cand_pos    int64   [B, k]       position of each option segment's last token (pad with 0)
+    outputs  logits      float32 [B, k]       raw candidate logits of the head (temperature not applied)
+Positions count from the start of the row (prefix, then branch). `DecisionGraph` is the row form (`input_ids`
+[rows, seq]), which decision2 exports.
 
 The head is the author's CandidateHead, recomputed from its own modules (the eager check below compares
 the graph with the author's forward):
@@ -29,18 +34,20 @@ import torch
 import torch.nn.functional as F
 
 from ..llm_common import onnx_export as ox
-from ..llm_common.qwen35 import CHUNK, Qwen35Trunk
+from ..llm_common.qwen35 import CHUNK, Qwen35Trunk, fork_rows, fork_shapes, fork_trace, gather_hidden
 from ...weightless_sharded import safetensors_source
 from . import ref
 from .layout import MAX_OPTIONS, MAX_ROW_TOKENS, MAX_SCORE_LEVELS, MIN_OPTIONS, NOUL_DEFAULTS, PROMPT_VERSION, \
     SUFFIX
 
-INPUT_NAMES = ["input_ids", "query_pos", "cand_pos"]
+INPUT_NAMES = ["prefix_ids", "branch_ids", "branch_job", "query_pos", "cand_pos"]
 OUTPUT_NAMES = ["logits"]
 LAYOUT = "decision-endpoint-v1"
 
 
 class DecisionGraph(torch.nn.Module):
+    """The row form (`input_ids`), which decision2 exports too."""
+
     def __init__(self, backbone, head, trunk=Qwen35Trunk):
         super().__init__()
         self.trunk = trunk(backbone)
@@ -50,11 +57,32 @@ class DecisionGraph(torch.nn.Module):
     def forward(self, input_ids, query_pos, cand_pos):
         h = self.trunk(input_ids).float()
         rows = torch.arange(h.shape[0], device=h.device)
-        c = self.head.candidate_norm(h[rows.unsqueeze(1), cand_pos])     # [R, K, H]
-        q = self.head.query_norm(h[rows, query_pos])                      # [R, H]
+        return self.score(h[rows.unsqueeze(1), cand_pos], h[rows, query_pos])
+
+    def score(self, hc, hq):
+        """Candidate hidden states [R, K, H] and query hidden states [R, H] -> logits [R, K]."""
+        c = self.head.candidate_norm(hc)
+        q = self.head.query_norm(hq)
         bilinear = (self.head.key(c) * self.head.query(q).unsqueeze(1)).sum(-1) * self.scale
         mlp = F.gelu(self.head.candidate_mlp(c) + self.head.query_mlp(q).unsqueeze(1))
         return bilinear + self.head.scalar(mlp).squeeze(-1)
+
+
+class DecisionForkGraph(DecisionGraph):
+    """The fork form (`Qwen35Trunk.fork`): a row is its prefix, then its branch; positions count from the row's start."""
+
+    def forward(self, prefix_ids, branch_ids, branch_job, query_pos, cand_pos):
+        hp, hb = self.trunk.fork(prefix_ids, branch_ids, branch_job)
+        return self.score(gather_hidden(hp, hb, branch_job, cand_pos).float(),
+                          gather_hidden(hp, hb, branch_job, query_pos).float())
+
+
+def fork_args(items, pad):
+    """Fork graph inputs for the author's encoded items, split as the runner splits them."""
+    k = max(len(it["candidate_positions"]) for it in items)
+    return (*map(torch.tensor, fork_rows([it["ids"] for it in items], pad)),
+            torch.tensor([it["query_position"] for it in items]),
+            torch.tensor([it["candidate_positions"] + [0] * (k - len(it["candidate_positions"])) for it in items]))
 
 
 def rename(name):
@@ -101,29 +129,37 @@ def export(slug, out_dir, root, empty=False):
         backbone, head = empty_model(d, root)
     else:
         backbone, head = d.model.backbone, d.model.head
-    graph = DecisionGraph(backbone, head).eval()
+    graph = DecisionForkGraph(backbone, head).eval()
     cfg = json.load(open(os.path.join(root, "decision_config.json"), encoding="utf-8"))
     assert cfg["prompt_version"] == PROMPT_VERSION and cfg["head_dim"] == 256, cfg
 
-    # Two rows padded to 256 tokens, three candidates each: every dynamic axis > 1. The rows come from
-    # the author's encode, and the eager graph is checked against the author's forward on them.
-    rows, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
-    T = -(-max(len(it["ids"]) for it in items) // CHUNK) * CHUNK
-    ids = torch.full((len(items), T), d.pad, dtype=torch.long)
-    for i, it in enumerate(items):
-        ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
-    args = (ids, torch.tensor([it["query_position"] for it in items]),
-            torch.tensor([it["candidate_positions"] for it in items]))
+    # The author's rows for two questions on one state: the fork graph is checked against the author's forward and
+    # against the row trunk (the same modules in the row form) on them.
     if not empty:
+        _, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
+        T = -(-max(len(it["ids"]) for it in items) // CHUNK) * CHUNK
+        ids = torch.full((len(items), T), d.pad, dtype=torch.long)
+        for i, it in enumerate(items):
+            ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
+        k = max(len(it["candidate_positions"]) for it in items)
+        row_args = (ids, torch.tensor([it["query_position"] for it in items]),
+                    torch.tensor([it["candidate_positions"] + [0] * (k - len(it["candidate_positions"])) for it in items]))
+        fork = fork_args(items, d.pad)
+        assert fork[0].shape[1] >= CHUNK and fork[2].tolist() == [0] * len(items), "the sample rows must fork"
         with torch.no_grad():
             want = d.forward(items)
-            got = graph(*args)
-        print("eager graph vs the author's forward: %.2e" % max(float((g - w).abs().max()) for g, w in zip(got, want)))
+            rows_out = DecisionGraph.forward(graph, *row_args)
+            got = graph(*fork)
+        print("eager fork graph vs the author's forward: %.2e"
+              % max(float((g[:len(w)] - w).abs().max()) for g, w in zip(got, want)))
+        print("fork graph vs row trunk: %.2e" % float((got - rows_out).abs().max()))
 
-    R = torch.export.Dim("rows", min=1, max=4096)
-    N = torch.export.Dim("chunks", min=1, max=4096)
+    dyn, B = fork_shapes()
     K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
-    dyn = {"input_ids": {0: R, 1: CHUNK * N}, "query_pos": {0: R}, "cand_pos": {0: R, 1: K}}
+    dyn |= {"query_pos": {0: B}, "cand_pos": {0: B, 1: K}}
+    # made-up inputs (`fork_trace`, k 6), with reads in both prefix and branch
+    args = (*fork_trace(backbone.embed_tokens.num_embeddings), torch.tensor([575, 300, 100]),
+            torch.tensor([[10, 200, 300, 400, 500, 575], [260, 261, 262, 263, 264, 265], [0, 255, 256, 257, 400, 575]]))
     tmp = ox.scratch_dir("decision-export-")
     secs = ox.export_graph(graph, args, INPUT_NAMES, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
     print("exported in %.0fs" % secs)
@@ -160,17 +196,22 @@ def export(slug, out_dir, root, empty=False):
                               "api": meta["api"], "api_sha256": ox.sha256_file(os.path.join(root, meta["api"]))},
                      "architecture": cfg["architecture"]},
         "contract": {
+            "form": "fork",
             "inputs": {
-                "input_ids": {"dtype": "int64", "shape": ["rows", "seq"],
-                              "note": "one row per question; seq a multiple of 64; right-pad with any id (pad)"},
+                "prefix_ids": {"dtype": "int64", "shape": ["jobs", "prefix"],
+                               "note": "shared row prefixes; prefix a multiple of 64"},
+                "branch_ids": {"dtype": "int64", "shape": ["rows", "seq"],
+                               "note": "each question's row after its prefix; seq a multiple of 64; right-pad with any id (pad)"},
+                "branch_job": {"dtype": "int64", "shape": ["rows"], "note": "the prefix each row continues"},
                 "query_pos": {"dtype": "int64", "shape": ["rows"], "note": "position of the row's last token"},
                 "cand_pos": {"dtype": "int64", "shape": ["rows", "k"],
-                             "note": "position of each option segment's last token; rows with fewer options pad with 0"},
+                             "note": "position of each option segment's last token in the row; rows with fewer options "
+                                     "pad with 0"},
             },
             "outputs": {"logits": {"dtype": "float32", "shape": ["rows", "k"],
                                    "note": "raw candidate logits; the first k_row entries are the row's option logits"}},
             "seq_multiple": CHUNK,
-            "positions": "0..seq-1, implicit",
+            "positions": "0..prefix+seq-1, implicit: a row is its prefix, then its branch",
             "attention": "causal; no mask input (right padding cannot reach earlier positions)",
         },
         "prompt_version": PROMPT_VERSION,

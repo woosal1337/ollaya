@@ -158,6 +158,17 @@ logits = (W_key c · W_query q) / sqrt(256) + w_scalar · gelu(W_cmlp c + b_cmlp
 - **Precision.** Opset 20; fp32 compute, BF16 backbone weights cast at load. Upstream serves the
   backbone under BF16 autocast on AMD gfx942; the reference here is the same code in fp32.
 
+### Fork form
+
+The export writes the graph in the fork form (`contract.form` `"fork"` in `decision.json`). Every row
+of a request starts with `Context:` and the state, so the graph computes that shared start once and
+continues it into each question ([ADR 0010](../decisions/0010-state-forking.md)). The graph takes
+`prefix_ids` [jobs, prefix], `branch_ids` [rows, seq] and `branch_job` [rows] instead of `input_ids`.
+Row `b` is `prefix_ids[branch_job[b]] ++ branch_ids[b]`. `query_pos`, `cand_pos` and `logits` do not
+change, and the positions count from the start of the row. The numbers are the row form's. The split
+and the contract are the same as kev's ([kev.md](kev.md#fork-form)). The runner also reads row-form
+graphs, and `decision2` stays in the row form.
+
 ## Measured parity
 
 `families/decision/parity.py`: ONNX Runtime CPU on the weightless graph against the author's code in
@@ -248,7 +259,8 @@ the same gate as above (option logits within 1e-3, same decisions):
   10.
 - **Context.** Up to 16,384 tokens per question row, the state included. The author trained on
   inputs of up to 9,129 tokens and does not claim long-context quality.
-- **Cost.** Every question re-reads the whole state; there is no shared-state cache.
+- **Cost.** A fork graph and MLX compute the state once per request ([Fork form](#fork-form)). A
+  row-form graph re-reads the whole state for every question.
 - **Candidate order.** Endpoints are causal, so a candidate can see the ones before it; the author
   notes that candidate-order invariance is not guaranteed.
 - **Calibration.** Probabilities can be overconfident (the author says so for Eos).

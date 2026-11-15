@@ -27,9 +27,10 @@ For each request, Ollaya Cloud keeps metadata only, which is what the **Usage** 
 | Request log | The metadata above, one row per request | 90 days after the request, then deleted |
 | Usage charts | Counts of requests and errors, input tokens, cost, and latency percentiles per key, model, endpoint, and region | Per minute for 6 hours, per hour for 32 days, per day for as long as the request log keeps the requests |
 | Usage stream | The metadata above, on its way from the gateway to billing and to the request log | The newest 10 million events of the region. An event that billing cannot post stays in a separate stream until the Ollaya Cloud team removes it. |
-| Operations logs and traces | Request, organization, and key IDs, models, status codes, and times, never request content | 30 days |
+| Traces | The timing of each decision and the log lines written during it, never request content | 30 days |
+| Service logs | Metadata such as request, organization, and key IDs, never request content | In the output of each service on its host. The code sets no time limit yet. |
 | Ledger | Credits, and debits as sums per organization, never per request | No deletion |
-| Spend totals | Spend per organization and per key, by month and in total | No deletion |
+| Spend totals | Spend per organization and per key, by month and in total, and the days of unusual spend with the keys and models that spent most | No deletion |
 
 Account data (your name, email address, passkeys, organizations, members, and the masked forms of keys) is kept while the account exists. To delete an account, write to the Ollaya Cloud team. **Account** → **Download my data (JSON)** exports your profile, sessions, passkeys, memberships, and what you did in each organization. The audit log keeps who changed what in each organization, and nobody can edit or delete an entry.
 

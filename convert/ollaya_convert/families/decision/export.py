@@ -11,7 +11,7 @@ row is its prefix followed by its branch, and every prefix runs once (`Qwen35Tru
              cand_pos    int64   [B, k]       position of each option segment's last token (pad with 0)
     outputs  logits      float32 [B, k]       raw candidate logits of the head (temperature not applied)
 Positions count from the start of the row (prefix, then branch). `DecisionGraph` is the row form (`input_ids`
-[rows, seq]), which decision2 exports.
+[rows, seq]), which decision2 exports for Kai (a Qwen3 trunk).
 
 The head is the author's CandidateHead, recomputed from its own modules (the eager check below compares
 the graph with the author's forward):
@@ -46,7 +46,7 @@ LAYOUT = "decision-endpoint-v1"
 
 
 class DecisionGraph(torch.nn.Module):
-    """The row form (`input_ids`), which decision2 exports too."""
+    """The row form (`input_ids`), which decision2 exports for Kai."""
 
     def __init__(self, backbone, head, trunk=Qwen35Trunk):
         super().__init__()

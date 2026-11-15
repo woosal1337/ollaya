@@ -2,9 +2,11 @@
 
     uv run python -m ollaya_convert.families.decision2.export decision2-eos --out out/decision2-eos [--root SNAPSHOT]
 
-The graph is Decision 1.0's (`decision.export.DecisionGraph`, contract in docs/families/decision.md): `input_ids`
-[rows, seq], `query_pos` [rows], `cand_pos` [rows, k] -> the head's raw `logits` [rows, k]. Kai's backbone is a dense
-Qwen3 (`llm_common/qwen3.py`), so its rows pad to a multiple of 8 instead of the DeltaNet chunk (64).
+The graph is Decision 1.0's (contract in docs/families/decision.md). The Qwen3.5 tags export its fork form
+(`decision.export.DecisionForkGraph`): `prefix_ids` [J, P], `branch_ids` [rows, S], `branch_job` [rows], `query_pos`
+[rows], `cand_pos` [rows, k] -> the head's raw `logits` [rows, k], positions counted from the start of the row. Kai's
+backbone is a dense Qwen3 (`llm_common/qwen3.py`) and stays in the row form (`DecisionGraph`, `input_ids` [rows, seq]),
+its rows padded to a multiple of 8 instead of the DeltaNet chunk (64).
 
 Weights are not copied: every initializer references the author's files at their byte offsets. The packages store the
 backbone's Linear weights in BF16 (as BF16 autocast rounds them; one Cast to float32 each) and every other tensor
@@ -19,10 +21,10 @@ import shutil
 
 import torch
 
-from ..decision.export import DecisionGraph, rename
+from ..decision.export import FORK_CONTRACT, INPUT_NAMES as FORK_INPUT_NAMES, SAMPLE_QUESTIONS, SAMPLE_STATE, \
+    DecisionForkGraph, DecisionGraph, fork_check, fork_export_args, rename
 from ..llm_common import onnx_export as ox
 from ..llm_common.qwen3 import Qwen3Trunk
-from ..llm_common.qwen35 import CHUNK, Qwen35Trunk
 from ...weightless_sharded import safetensors_source
 from . import ref
 from .layout import MAX_OPTIONS, MAX_SCORE_LEVELS, MIN_OPTIONS, NOUL_DEFAULTS, PROMPT_VERSION
@@ -32,12 +34,6 @@ INPUT_NAMES = ["input_ids", "query_pos", "cand_pos"]
 OUTPUT_NAMES = ["logits"]
 LAYOUT = "decision2-endpoint-v1"
 QWEN3_MULTIPLE = 8  # upstream's collate pads to a multiple of 8; a dense causal graph needs no more
-
-SAMPLE_STATE = "The customer was charged twice for order A-104 and wants the duplicate refunded today. " * 6
-SAMPLE_QUESTIONS = {
-    "a": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "charges", "tech": "bugs", "other": None}},
-    "b": {"type": "score", "instructions": "How upset?", "criteria": ["calm", "annoyed", "furious"]},
-}
 
 
 def empty_model(d, root, qwen3):
@@ -73,32 +69,39 @@ def export(slug, out_dir, root, empty=False):
     assert cfg.get("head_variant", "shared") == "shared" and cfg["architecture"].endswith(
         "-text-endpoints-global-query-shared-bilinear-mlp"), cfg["architecture"]
     qwen3 = cfg["architecture"].startswith("qwen3-")
-    multiple = QWEN3_MULTIPLE if qwen3 else CHUNK
     d = ref.load(root, slug, device="cpu", load_model=not empty)
     backbone, head = empty_model(d, root, qwen3) if empty else (d.model.backbone, d.model.head)
-    graph = DecisionGraph(backbone, head, Qwen3Trunk if qwen3 else Qwen35Trunk).eval()
 
-    # Two rows padded to a whole number of steps, three candidates each: every dynamic axis > 1. The rows come from the
-    # author's encode, and the eager graph is checked against the author's forward on them.
-    rows, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
-    T = -(-max(len(it["ids"]) for it in items) // multiple) * multiple
-    ids = torch.full((len(items), T), d.pad, dtype=torch.long)
-    for i, it in enumerate(items):
-        ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
-    args = (ids, torch.tensor([it["query_position"] for it in items]),
-            torch.tensor([it["candidate_positions"] for it in items]))
-    if not empty:
-        with torch.no_grad():
-            want = d.forward(items)
-            got = graph(*args)
-        print("eager graph vs the author's forward: %.2e" % max(float((g - w).abs().max()) for g, w in zip(got, want)))
+    if qwen3:  # Kai: the row form (the fork form needs a Qwen3.5 trunk)
+        graph = DecisionGraph(backbone, head, Qwen3Trunk).eval()
+        # Two rows padded to a whole number of steps, three candidates each: every dynamic axis > 1. The rows come
+        # from the author's encode, and the eager graph is checked against the author's forward on them.
+        rows, items = d.encode(SAMPLE_STATE, SAMPLE_QUESTIONS)
+        T = -(-max(len(it["ids"]) for it in items) // QWEN3_MULTIPLE) * QWEN3_MULTIPLE
+        ids = torch.full((len(items), T), d.pad, dtype=torch.long)
+        for i, it in enumerate(items):
+            ids[i, :len(it["ids"])] = torch.tensor(it["ids"])
+        args = (ids, torch.tensor([it["query_position"] for it in items]),
+                torch.tensor([it["candidate_positions"] for it in items]))
+        if not empty:
+            with torch.no_grad():
+                want = d.forward(items)
+                got = graph(*args)
+            print("eager graph vs the author's forward: %.2e" % max(float((g - w).abs().max()) for g, w in zip(got, want)))
 
-    R = torch.export.Dim("rows", min=1, max=4096)
-    N = torch.export.Dim("steps", min=1, max=4096)
-    K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
-    dyn = {"input_ids": {0: R, 1: multiple * N}, "query_pos": {0: R}, "cand_pos": {0: R, 1: K}}
+        R = torch.export.Dim("rows", min=1, max=4096)
+        N = torch.export.Dim("steps", min=1, max=4096)
+        K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
+        dyn = {"input_ids": {0: R, 1: QWEN3_MULTIPLE * N}, "query_pos": {0: R}, "cand_pos": {0: R, 1: K}}
+        names = INPUT_NAMES
+    else:
+        graph = DecisionForkGraph(backbone, head).eval()
+        if not empty:
+            fork_check(d, graph)
+        args, dyn = fork_export_args(backbone.embed_tokens.num_embeddings)
+        names = FORK_INPUT_NAMES
     tmp = ox.scratch_dir("decision2-export-")
-    secs = ox.export_graph(graph, args, INPUT_NAMES, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
+    secs = ox.export_graph(graph, args, names, OUTPUT_NAMES, dyn, os.path.join(tmp, "model.onnx"))
     print("exported in %.0fs" % secs)
     params = {"trunk.m." + n for n, _ in backbone.named_parameters()} | {"head." + n for n, _ in head.named_parameters()}
     del graph, backbone, head
@@ -127,7 +130,7 @@ def export(slug, out_dir, root, empty=False):
                      "runtime": {"entry": pointer["runtime"]["entry"], "profile": manifest["profile"],
                                  "files_sha256": {f: manifest["files_sha256"][f] for f in sorted(manifest["files_sha256"])
                                                   if f.startswith("decision2/")}}},
-        "contract": {
+        "contract": FORK_CONTRACT if not qwen3 else {
             "inputs": {
                 "input_ids": {"dtype": "int64", "shape": ["rows", "seq"],
                               "note": "one row per question; seq a multiple of seq_multiple; right-pad with any id (pad)"},
@@ -137,7 +140,7 @@ def export(slug, out_dir, root, empty=False):
             },
             "outputs": {"logits": {"dtype": "float32", "shape": ["rows", "k"],
                                    "note": "raw candidate logits in option order; the first k_row entries are the row's"}},
-            "seq_multiple": multiple,
+            "seq_multiple": QWEN3_MULTIPLE,
             "positions": "0..seq-1, implicit",
             "attention": "causal; no mask input (right padding cannot reach earlier positions)",
         },

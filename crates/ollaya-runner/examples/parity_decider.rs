@@ -94,6 +94,8 @@ struct Case {
 }
 
 fn main() -> Result<()> {
+    // SAFETY: first thing in main, before any thread starts (MLX reads its settings once).
+    unsafe { ollaya_runner::prepare_process() };
     let (args, smoke) = smoke::args();
     if args.len() < 3 {
         bail!(

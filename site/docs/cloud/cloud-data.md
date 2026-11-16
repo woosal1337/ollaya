@@ -20,6 +20,8 @@ For each request, Ollaya Cloud keeps metadata only, which is what the **Usage** 
 - the total, model, and load times
 - your tags (`X-Ollaya-Tags`) and the SDK name and version it sent
 
+It also keeps the /24 (IPv4) or /48 (IPv6) prefix of the caller's address, never the full address. The pages do not show the prefix.
+
 ## For how long
 
 | Where | What | How long |

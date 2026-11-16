@@ -35,3 +35,5 @@ Revoke a key on the **API keys** page. Every gateway refuses it at once in norma
 ## Remove a member
 
 When an Owner or Admin removes a member on the **Members** page, Ollaya Cloud first revokes the active keys that the member created. To keep these keys working, select **Keep *name*'s keys working** before you remove the member. A kept key bills the organization as before. A kept management key stops working, because it acts with the role of its creator.
+
+When a member deletes their account, the keys that they created stop, and nobody can keep them. See [Delete your account](/docs/cloud-data#delete-your-account).

@@ -33,6 +33,16 @@ The management API has its own request limits. They do not depend on the tier.
 
 Over a limit, a request gets `429 RATE_LIMITED` with `Retry-After` in seconds. A usage query that reaches its time limit of 30 seconds or its memory limit gets `422 INVALID_REQUEST`: use a shorter range.
 
+Dashboard pages count against the limit of a person. Over it, a page says "Too many requests. Wait a few seconds, then reload." **Export line items as CSV** on the **Usage** page and **Download my data (JSON)** answer `429` with `Retry-After`.
+
+## Members and invitations
+
+An organization can have 100 pending invitations. An organization and a person can each send 50 invitation emails in 24 hours, resends included.
+
+- At 100 pending invitations, the **Members** page refuses a new invitation. Cancel an invitation, then try again.
+- At 50 invitation emails, the **Members** page says which limit refused the invitation and when to try again.
+- At 100 members, the invitation page refuses to accept an invitation. Ask an Owner or Admin to remove a member, then accept again.
+
 ## Rate-limit headers
 
 Answers to decisions carry the IETF rate-limit fields (`draft-ietf-httpapi-ratelimit-headers`, revision 11):

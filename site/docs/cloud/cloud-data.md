@@ -36,7 +36,7 @@ It also keeps the /24 (IPv4) or /48 (IPv6) prefix of the caller's address, never
 
 The usage charts and the request log thus go back 90 days. The **Usage** page and the management API accept a range of up to 400 days. They show no data for a day older than 90 days.
 
-Account data (your name, email address, passkeys, organizations, members, and the masked forms of keys) is kept while the account exists. To delete an account, write to the Ollaya Cloud team. **Account** → **Download my data (JSON)** exports your profile, sessions, passkeys, memberships, and what you did in each organization. The audit log keeps who changed what in each organization, and nobody can edit or delete an entry.
+Account data (your name, email address, passkeys, organizations, members, and the masked forms of keys) is kept while the account exists. To delete an account, write to the Ollaya Cloud team. **Account** → **Download my data (JSON)** exports your profile, sessions, passkeys, memberships, and what you did in each organization. The file holds at most 100 sessions, 100 passkeys, and your newest 10,000 actions. Its `lists` field says for each list whether it is complete. The audit log keeps who changed what in each organization, and nobody can edit or delete an entry.
 
 ## Keys
 

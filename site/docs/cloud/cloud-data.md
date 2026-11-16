@@ -28,7 +28,7 @@ For each request, Ollaya Cloud keeps metadata only, which is what the **Usage** 
 | Usage charts | Counts of requests and errors, input tokens, cost, and latency percentiles per key, model, endpoint, and region | Per minute for 6 hours, per hour for 32 days, per day for as long as the request log keeps the requests |
 | Usage stream | The metadata above, on its way from the gateway to billing and to the request log | The newest 1 million events of the region. An event that billing cannot post stays in a separate stream until the Ollaya Cloud team removes it. |
 | Traces | The timing of each decision and the log lines written during it, never request content | 30 days |
-| Service logs | Metadata such as request, organization, and key IDs, never request content | In the output of each service on its host. The code sets no time limit yet. |
+| Service logs | Metadata such as request, organization, and key IDs, never request content | 30 days. The host of each service also keeps its newest lines, up to 50 MB for each service. |
 | Ledger | Credits, and debits as sums per organization, never per request | No deletion |
 | Spend totals | Spend per organization and per key, by month and in total, and the days of unusual spend with the keys and models that spent most | No deletion |
 

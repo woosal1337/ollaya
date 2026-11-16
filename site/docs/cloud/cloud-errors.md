@@ -16,7 +16,7 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | Code | Status | When | What to do |
 | --- | --- | --- | --- |
 | `INVALID_JSON` | 400 | The body is not valid JSON | Fix the request |
-| `UNAUTHORIZED` | 401 | The key is missing, malformed, unknown, revoked, or expired | Check `Authorization: Bearer oly_live_…` |
+| `UNAUTHORIZED` | 401 | The key is missing, malformed, unknown, revoked, or expired, or its scope does not allow the route | Check `Authorization: Bearer oly_live_…` and the key's scope |
 | `INSUFFICIENT_CREDITS` | 402 | The organization's balance is used up | Ask the Ollaya Cloud team for credit with the form on the **Credits** page |
 | `SPEND_CAP_REACHED` | 402 | The key's or the organization's budget is used up | Raise the cap or the budget. A monthly cap or budget starts again in the next month |
 | `FORBIDDEN` | 403 | Your role does not allow this (management API) | Ask an Owner or Admin |

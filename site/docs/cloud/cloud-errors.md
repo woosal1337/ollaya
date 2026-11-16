@@ -25,10 +25,13 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | `BROWSER_NOT_ALLOWED` | 403 | The request came from a browser (`Origin` header) | Call Ollaya Cloud from your server |
 | `SSO_REQUIRED` | 403 | The organization requires single sign-on, the caller is not an Owner, and the dashboard session did not come from the organization's identity provider (management API, dashboard sessions only) | Sign in with single sign-on |
 | `TWO_FACTOR_REQUIRED` | 403 | The organization requires a second factor, and the person has neither two-step verification nor a passkey (management API, dashboard sessions only) | Add an authenticator app or a passkey on the **Sign-in security** page |
+| `FRESH_SIGN_IN_REQUIRED` | 403 | An account delete needs a sign-in of the last ten minutes (management API, dashboard sessions only) | Sign in again |
 | `MODEL_NOT_FOUND` | 404 | The model is not in the catalog | `GET /v1/models` lists the available models |
 | `NOT_FOUND` | 404 | The path does not exist | Check the path |
 | `METHOD_NOT_ALLOWED` | 405 | The path exists with other methods, listed in `Allow` | Use one of those |
 | `OPERATION_IN_PROGRESS` | 409 | A request with the same `Idempotency-Key` is still running (management API) | Retry later |
+| `LAST_OWNER` | 409 | An account delete would leave an organization with other members and no Owner. `orgs` lists these organizations (management API, dashboard sessions only) | Make another member an Owner |
+| `ORG_HAS_CREDIT` | 409 | An organization that an account delete would close has credit other than the welcome credit. `orgs` lists these organizations (management API, dashboard sessions only) | Write to the Ollaya Cloud team |
 | `REQUEST_TOO_LARGE` | 413 | The body is larger than 8 MiB, compressed or not | Send a smaller state |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | An unknown content encoding, or more than one | Send `gzip` or `zstd`, or no encoding |
 | `IDEMPOTENCY_KEY_REUSED` | 422 | The `Idempotency-Key` was used with a different request (management API) | Use a new key |

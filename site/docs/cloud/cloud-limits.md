@@ -21,6 +21,18 @@ Each organization has a request rate (with a burst on top) and a number of reque
 
 A key can have lower limits than its organization (see [Keys](/docs/cloud-keys)). Over the rate, a request gets `429 RATE_LIMITED`. Over the concurrency, it gets `429 CONCURRENCY_LIMITED`. Both carry `Retry-After` in seconds.
 
+## Limits of the management API
+
+The management API has its own request limits. They do not depend on the tier.
+
+| Caller | Requests per second | Burst |
+|---|---|---|
+| A management key | 10 | 20 |
+| A person in the dashboard | 20 | 60 |
+| A request with no valid credential, for each client address | 10 | 30 |
+
+Over a limit, a request gets `429 RATE_LIMITED` with `Retry-After` in seconds. A usage query that reaches its time limit of 30 seconds or its memory limit gets `422 INVALID_REQUEST`: use a shorter range.
+
 ## Rate-limit headers
 
 Answers to decisions carry the IETF rate-limit fields (`draft-ietf-httpapi-ratelimit-headers`, revision 11):

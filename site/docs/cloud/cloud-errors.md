@@ -23,6 +23,7 @@ Every response carries `X-Request-Id` (your own value when it matches `[A-Za-z0-
 | `MODEL_NOT_ALLOWED` | 403 | The key or the organization may not call this model | Change the key's or the organization's model access |
 | `IP_NOT_ALLOWED` | 403 | The key has an IP allowlist and the caller is outside it | Add the address to the key |
 | `BROWSER_NOT_ALLOWED` | 403 | The request came from a browser (`Origin` header) | Call Ollaya Cloud from your server |
+| `ORG_SUSPENDED` | 403 | The Ollaya Cloud team suspended the organization. Decisions and the playground stop, and the dashboard and the management API still work | Write to the Ollaya Cloud team |
 | `SSO_REQUIRED` | 403 | The organization requires single sign-on, the caller is not an Owner, and the dashboard session did not come from the organization's identity provider (management API, dashboard sessions only) | Sign in with single sign-on |
 | `TWO_FACTOR_REQUIRED` | 403 | The organization requires a second factor, and the person has neither two-step verification nor a passkey (management API, dashboard sessions only) | Add an authenticator app or a passkey on the **Sign-in security** page |
 | `FRESH_SIGN_IN_REQUIRED` | 403 | An account delete needs a sign-in of the last ten minutes (management API, dashboard sessions only) | Sign in again |
